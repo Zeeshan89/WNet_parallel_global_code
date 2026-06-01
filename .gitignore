@@ -1,0 +1,13 @@
+# Ignore everything by default
+*
+
+# But descend into subdirectories so nested code files can be matched
+!*/
+
+# Allow only source/code files
+!*.py
+!*.ipynb
+!*.sh
+
+# Keep this file itself
+!.gitignore
