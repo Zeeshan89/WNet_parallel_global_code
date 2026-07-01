@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=8
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=7
-#SBATCH --time=01:59:00
+#SBATCH --time=01:55:00
 #SBATCH -q normal
 #SBATCH -o logs/output-%j.txt
 #SBATCH -e logs/error-%j.txt

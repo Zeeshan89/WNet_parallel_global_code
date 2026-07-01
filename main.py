@@ -264,6 +264,7 @@ def _process_one_file(
     data_dir, cache_loader, vorticity_files, wind_speed_full,
     temp_500mb_dir, windshear_dir, Bright_temp,
     vor850_results_per, windspeed_results_per, mslp_anom_result_glob,
+    iwv_clim_result_glob,
     ibtracs_lookup, interp_percentile,
     model, optimizer, scheduler, scaler, ema,
     device, distributed, world_size, rank,
@@ -566,8 +567,10 @@ def _process_one_file(
             global_stats=global_stats,
             precompute=True,
             mslp_climatology=mslp_anom_result_glob,
+            iwv_climatology=iwv_clim_result_glob,     # IWV monthly clim → anomaly gate
+            mcs_moisture_mode="anomaly",              # "anomaly" | "anomaly_soft" | "absolute"
             ibtracs_lookup=ibtracs_this_month,
-            year=year, 
+            year=year,
             month=month
         )
 
@@ -703,10 +706,18 @@ def main_improved(
                                   "wind_speed_850/output/windspeed850_75th_percentile_global.nc")
     mslp_anomaly_glob          = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
                                   "data/global_stats/mslp_monthly_climatology.nc")
+    iwv_climatology_glob       = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                                  "data/global_stats/iwv_monthly_climatology.nc")
 
     vor850_results_per    = load_percentile_dataset(vor850_results_per_path,    rank)
     windspeed_results_per = load_percentile_dataset(windspeed_results_per_path, rank)
     mslp_anom_result_glob = load_percentile_dataset(mslp_anomaly_glob,          rank)
+    # IWV monthly climatology → anomaly-based MCS moisture gate (Option 1).
+    # Falls back to the legacy absolute-IWV gate if the file is absent.
+    iwv_clim_result_glob  = (load_percentile_dataset(iwv_climatology_glob, rank)
+                             if os.path.exists(iwv_climatology_glob) else None)
+    if rank == 0 and iwv_clim_result_glob is None:
+        print(f"⚠ IWV climatology not found at {iwv_climatology_glob} — MCS uses absolute-IWV gate")
 
     # ── Auxiliary data paths ──────────────────────────────────────────────────
     vorticity_dir  = ("/lustre/orion/cli138/proj-shared/z7a/Storms_data/"
@@ -945,6 +956,7 @@ def main_improved(
                 vor850_results_per=vor850_results_per,
                 windspeed_results_per=windspeed_results_per,
                 mslp_anom_result_glob=mslp_anom_result_glob,
+                iwv_clim_result_glob=iwv_clim_result_glob,
                 ibtracs_lookup=ibtracs_lookup,
                 interp_percentile=interp_percentile,
                 model=model,
@@ -1028,6 +1040,7 @@ def main_improved(
                     vor850_results_per=vor850_results_per,
                     windspeed_results_per=windspeed_results_per,
                     mslp_anom_result_glob=mslp_anom_result_glob,
+                    iwv_clim_result_glob=iwv_clim_result_glob,
                     ibtracs_lookup=ibtracs_lookup,
                     interp_percentile=interp_percentile,
                     model=model,

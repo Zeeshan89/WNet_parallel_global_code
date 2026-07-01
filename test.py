@@ -1,4 +1,19 @@
 import os
+
+# ── MIOpen: per-process SQLite cache + skip kernel search ────────────────────
+# MUST happen before `import torch`. Without this, MIOpen's default per-user
+# SQLite db on the home/lustre filesystem hits "disk I/O error" on Frontier and
+# every Conv2d fails with miopenStatusInternalError. Mirrors main.py's block.
+_rank = int(os.environ.get("SLURM_PROCID", 0))
+_world = int(os.environ.get("SLURM_NTASKS", 1))   # for multi-GPU file sharding
+_miopen_cache = f"/tmp/miopen-cache-rank-{_rank}"
+os.makedirs(_miopen_cache, exist_ok=True)
+os.environ["MIOPEN_USER_DB_PATH"]     = _miopen_cache
+os.environ["MIOPEN_CUSTOM_CACHE_DIR"] = _miopen_cache
+os.environ["MIOPEN_FIND_MODE"]        = "2"   # FAST: no search, use defaults
+os.environ["MIOPEN_DISABLE_CACHE"]    = "0"
+# ─────────────────────────────────────────────────────────────────────────────
+
 import gc
 import glob
 import numpy as np
@@ -25,7 +40,7 @@ from skimage.measure import regionprops
 # You might need to adjust these imports based on your actual file structure
 from WNet_model import ImprovedWNet
 from dataset import ARDatasetImproved, preprocess_data_improved
-from post_processing import enhanced_post_process_ar_segmentation
+from post_processing import enhanced_post_process_ar_segmentation, track_mcs_timeseries
 from utils import setup_gpu, calculate_ivt, find_matching_vorticity, load_percentile_dataset
 from scipy.ndimage import binary_opening, binary_closing
 import numpy as np
@@ -41,6 +56,7 @@ import cartopy.crs as ccrs
 from matplotlib.colors import ListedColormap
 import matplotlib
 from ibtracs_loader import load_ibtracs_for_training
+from distributed_dataset import get_rank_files
 
 # Set matplotlib backend for non-interactive environments
 matplotlib.use('Agg')
@@ -50,7 +66,34 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 target_size = (360, 720)  # Default size, can be adjusted
 
 
-def save_results_to_netcdf(ar_results, hurricane_results, etcs_results, mcs_results, original_dataset, output_dir, nc_filename):
+def clean_edge_artifacts(mask, seam_cols=2, pole_rows=2):
+    """Remove CNN zero-padding edge stripes from a 2-D detection map (lat, lon).
+
+    The WNet uses zero-padding convolutions, so on a global periodic field the
+    network sees zeros past the antimeridian (±180°) and the poles and can emit a
+    thin stripe of spurious/dropped detections in the outermost columns/rows.
+
+    Longitude seam (±180°) = first/last columns; poles = first/last rows.
+    Each edge band is overwritten with its nearest *interior* column/row, so a
+    spurious edge-only line (interior neighbour = 0) is erased, while a genuine
+    storm that extends inward (interior neighbour = 1) is preserved.
+    """
+    if mask is None or getattr(mask, 'ndim', None) != 2:
+        return mask
+    out = mask.copy()
+    nlat, nlon = out.shape
+    # Longitude seam — vertical lines
+    if seam_cols > 0 and nlon > 2 * seam_cols:
+        out[:, :seam_cols]  = out[:, seam_cols][:, None]
+        out[:, -seam_cols:] = out[:, -seam_cols - 1][:, None]
+    # Poles — horizontal lines
+    if pole_rows > 0 and nlat > 2 * pole_rows:
+        out[:pole_rows, :]  = out[pole_rows, :][None, :]
+        out[-pole_rows:, :] = out[-pole_rows - 1, :][None, :]
+    return out
+
+
+def save_results_to_netcdf(ar_results, hurricane_results, etcs_results, mcs_results, original_dataset, output_dir, nc_filename, mcs_id_results=None):
     """
     Save post-processed AR, hurricane, ETC, and MCS results to separate NetCDF files.
     
@@ -180,8 +223,17 @@ def save_results_to_netcdf(ar_results, hurricane_results, etcs_results, mcs_resu
         'description': 'Post-processed MCS detection probability from WNet segmentation'
     }
 
-    
-    
+    # Tracked storm-ID field (analogous to Feng's cloudtracknumber) so the shared
+    # benchmark metric code can compute true ID-based storm-hours for WNet.
+    if mcs_id_results is not None:
+        mcs_ds['MCS_id'] = (['time', 'latitude', 'longitude'], mcs_id_results)
+        mcs_ds['MCS_id'].attrs = {
+            'long_name': 'MCS storm track ID',
+            'units': 'id',
+            'description': 'Overlap-tracked MCS storm ID per pixel (0 = none); '
+                           'IDs are per monthly file. Analogous to FLEXTRKR/Feng cloudtracknumber.'
+        }
+
     # Generate output filenames
     base_name = nc_filename.replace('.nc', '')
     ar_filename = f"{base_name}_AR_detection.nc"
@@ -479,28 +531,11 @@ def evaluate_and_save_results(model, dataset, era5_dataset, vorticity_data, wind
             #     post_processed_hurricane_map_final = np.flipud(post_processed_hurricane_map)
             # else:
             
-            # Post-process MCS detection
-            try:
-                post_processed_mcs_map = enhanced_post_process_ar_segmentation(
-                    mcs_map,
-                    storm_class=4,  # New MCS class
-                    ivt_data=None,
-                    vor_data=vor_data_processing,
-                    mslp_data=mslp_data_processing,
-                    percentile_threshold=None,
-                    min_size=5,  # Small minimum size for MCS
-                    km_per_pixel=27.75,
-                    vor_threshold=4.6e-05,  # Lower vorticity threshold for MCS
-                    mslp_eye_threshold=101200,  # 1012 hPa threshold for MCS
-                    lat_bounds=None,
-                    gradient_threshold=0.3,
-                    sample_data=sample_np
-                )
-                            
-                print(f"MCS post-processing successful - pixels: {np.sum(post_processed_mcs_map)}")
-            except Exception as e:
-                print(f"Error in MCS post-processing: {e}")
-                post_processed_mcs_map = mcs_map  # Use original if post-processing fails
+            # MCS: keep RAW model blobs — no per-frame model/physics filtering.
+            # Area (60,000 km²) + temporal-overlap (50–90%) are applied to the full
+            # month time series after this loop (post_process_mcs_timeseries).
+            post_processed_mcs_map = mcs_map.copy()
+            print(f"MCS raw blobs kept (no per-frame filter) - pixels: {np.sum(post_processed_mcs_map)}")
 
             
             post_processed_ar_map_final = post_processed_ar_map
@@ -530,6 +565,12 @@ def evaluate_and_save_results(model, dataset, era5_dataset, vorticity_data, wind
                                                     order=0, mode='reflect', anti_aliasing=False)
 
 
+            # Clean CNN zero-padding edge stripes (vertical ±180° seam, horizontal poles)
+            post_processed_ar_map_final        = clean_edge_artifacts(post_processed_ar_map_final)
+            post_processed_hurricane_map_final = clean_edge_artifacts(post_processed_hurricane_map_final)
+            post_processed_etc_map_final       = clean_edge_artifacts(post_processed_etc_map_final)
+            post_processed_mcs_map_final       = clean_edge_artifacts(post_processed_mcs_map_final)
+
             # Store results
             ar_results[index] = post_processed_ar_map_final
             hurricane_results[index] = post_processed_hurricane_map_final
@@ -538,9 +579,18 @@ def evaluate_and_save_results(model, dataset, era5_dataset, vorticity_data, wind
             
             print(f"Final results - AR pixels: {np.sum(post_processed_ar_map_final)}, ETCs pixels: {np.sum(post_processed_etc_map_final)}, Hurricane pixels: {np.sum(post_processed_hurricane_map_final)}, MCS pixels: {np.sum(post_processed_mcs_map_final)}")
     
+    # MCS: RAW model blobs + overlap tracking → storm-ID field (MCS_id), so the
+    # benchmark metric can compute true ID-based storm-hours for WNet.
+    # OVERLAP-ONLY: no minimum-area criterion, no minimum-lifetime pruning.
+    mcs_results, mcs_id_results = track_mcs_timeseries(
+        mcs_results, lats, lons,
+        min_area_km2=None, link_overlap=0.5, min_lifetime_steps=1,
+    )
+
     # Save results to NetCDF files
     ar_filepath, hurricane_filepath, etc_filepath, mcs_filepath = save_results_to_netcdf(
-        ar_results, hurricane_results, etcs_results, mcs_results, era5_dataset, output_dir, nc_file
+        ar_results, hurricane_results, etcs_results, mcs_results, era5_dataset, output_dir, nc_file,
+        mcs_id_results=mcs_id_results,
     )
     
     print(f"Completed processing {nc_file}")
@@ -950,7 +1000,21 @@ def find_latest_checkpoint(checkpoint_dir='.'):
     return checkpoint_files[0]
 
 
-def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2024, output_dir=None):
+def _month_outputs_exist(output_dir, nc_file):
+    """True iff ALL four per-class detection NetCDFs for this month already exist.
+
+    A month is 'done' only when AR, Hurricane, ETCs and MCS files are all present.
+    save_results_to_netcdf writes MCS last, so requiring all four guards against a
+    job that was killed mid-save (partial month → reprocessed, not falsely skipped).
+    """
+    base = nc_file.replace('.nc', '')
+    suffixes = ('_AR_detection.nc', '_Hurricane_detection.nc',
+                '_ETCs_detection.nc', '_MCS_detection.nc')
+    return all(os.path.isfile(os.path.join(output_dir, base + s)) for s in suffixes)
+
+
+def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2024,
+                     output_dir=None, skip_existing=True, start_month=1, end_month=12):
     """
     Main function to test the model on all data files from start_year to end_year and save results.
     
@@ -982,6 +1046,8 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
     # Tpr_results_per_path = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/data/tpr_percentiles/tpr_nonzero_85th_percentile_global.nc'
     # BT10_results_per_path = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/OLR/brightness_temp_new/output/bt_10th_percentile_global.nc'
     mslp_anomaly_glob = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/data/global_stats/mslp_monthly_climatology.nc'
+    # IWV monthly climatology (12, lat, lon) for the MCS moisture-anomaly gate (Option 1).
+    iwv_climatology_glob = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/data/global_stats/iwv_monthly_climatology.nc'
 
 
     # percentile_threshold   = load_percentile_dataset(IVT_90th_percentile_path)
@@ -991,6 +1057,11 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
     # Tpr_results_per       = load_percentile_dataset(Tpr_results_per_path)
     # BT10_results_per       = load_percentile_dataset(BT10_results_per_path)
     mslp_anom_result_glob = load_percentile_dataset(mslp_anomaly_glob)
+    # Falls back to absolute-IWV gating if the climatology file is absent.
+    iwv_clim_result_glob = (load_percentile_dataset(iwv_climatology_glob)
+                            if os.path.exists(iwv_climatology_glob) else None)
+    if iwv_clim_result_glob is None:
+        print(f"⚠ IWV climatology not found at {iwv_climatology_glob} — MCS uses absolute-IWV gate")
     
     # Load SST data directory # era5_sst_1980.nc
     # SST_dir = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/sst/celsius/'
@@ -1058,8 +1129,7 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
     model.eval()  # Set model to evaluation mode
     print(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
     
-    start_month=1
-    end_month=5
+    print(f"Month range: {start_month:02d}-{end_month:02d}")
 
     # Get all ERA5 files in the specified year range
     if os.path.isdir(data_dir):
@@ -1081,10 +1151,36 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
 
         # Sort the files
         nc_files = sorted(nc_files)
-        
+
         if not nc_files:
             print(f"No files found for year range {start_year}-{end_year}")
             return
+
+        # ── Resume: drop months whose outputs already exist ───────────────────────────
+        # Decided up-front on the GLOBAL list (before sharding / before any GPU work),
+        # so no rank ever processes a month then skips it at save time. All ranks see
+        # the same output dir and compute the SAME remaining list deterministically,
+        # so the round-robin shard below stays disjoint and balanced.
+        if skip_existing and output_dir is not None:
+            before = len(nc_files)
+            nc_files = [f for f in nc_files if not _month_outputs_exist(output_dir, f)]
+            if _rank == 0:
+                print(f"[resume] {before - len(nc_files)}/{before} months already complete "
+                      f"in {output_dir} — skipping; {len(nc_files)} remaining to process")
+
+        if not nc_files:
+            if _rank == 0:
+                print("[resume] All requested months already complete — nothing to do.")
+            return
+
+        # ── File-level sharding for multi-GPU inference (round-robin, matches training) ──
+        # Shards the REMAINING (not-yet-done) files, so work stays balanced across GPUs
+        # even on a partially-completed run.
+        if _world > 1:
+            all_count = len(nc_files)
+            nc_files = get_rank_files(nc_files, _rank, _world, shuffle=False)
+            print(f"[rank {_rank}/{_world}] handling {len(nc_files)}/{all_count} remaining files: "
+                  f"{[f for f in nc_files]}")
     else:
         raise ValueError("data_dir must be a directory containing ERA5 files")
     
@@ -1328,6 +1424,8 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
                 global_stats=global_stats,          # ← ADD THIS
                 precompute=False,
                 mslp_climatology=mslp_anom_result_glob,
+                iwv_climatology=iwv_clim_result_glob,     # IWV monthly clim → anomaly gate
+                mcs_moisture_mode="anomaly",              # "anomaly" | "anomaly_soft" | "absolute"
                 ibtracs_lookup=ibtracs_this_month,   # ← ADD THIS
             )
             
@@ -1394,16 +1492,50 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
 
 
 if __name__ == "__main__":
-    # Configuration
-    data_directory = "/lustre/orion/cli138/proj-shared/z7a/Storms_data/data/"  
-    checkpoint_path = "/lustre/orion/cli138/proj-shared/z7a/Storms_data/Storms_precipitation_notebooks/Percentile_ARs_detection/ARs_Hurricanes_ETCs_MCS/MCS_enhanced_trial60/ema_checkpoint_epoch_40.pth"    
-    output_directory = "/lustre/orion/cli138/proj-shared/z7a/Storms_data/Storms_precipitation_notebooks/Percentile_ARs_detection/ARs_Hurricanes_ETCs_MCS/MCS_enhanced_trial61/ETCs_enchanced_test_etc_24"
-    
-    # Run batch evaluation for all years from 1980 to 2024
+    # CLI: any unspecified arg falls back to the historical defaults below.
+    _parser = argparse.ArgumentParser(
+        description="Forward-only inference: load checkpoint, run over a year range, "
+                    "write per-class detection NetCDFs to --output-dir.",
+    )
+    _parser.add_argument(
+        "--data-dir",
+        default="/lustre/orion/cli138/proj-shared/z7a/Storms_data/data/",
+        help="ERA5 monthly NetCDF dir (default: project's data/)",
+    )
+    _parser.add_argument(
+        "--checkpoint",
+        default=("/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/WNet_parallel_global_code/ARs_Hurricanes_ETCs_MCS/Trail9/final_checkpoint_2006_2024.pth"),
+        help="Path to .pth checkpoint (default: legacy MCS_enhanced_trial60 epoch 40)",
+    )
+    _parser.add_argument(
+        "--output-dir",
+        default=("/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/WNet_parallel_global_code/ARs_Hurricanes_ETCs_MCS/Outputs"),
+        help="Where to write per-class detection NetCDFs",
+    )
+    _parser.add_argument("--start-year", type=int, default=2004)
+    _parser.add_argument("--end-year",   type=int, default=2017)
+    _parser.add_argument("--start-month", type=int, default=1, help="First month to process (1-12)")
+    _parser.add_argument("--end-month",   type=int, default=12, help="Last month to process (1-12)")
+    _parser.add_argument(
+        "--force-reprocess",
+        action="store_true",
+        help="Reprocess months even if their output NetCDFs already exist "
+             "(default: skip already-complete months for resume).",
+    )
+    _args = _parser.parse_args()
+
+    print(f"[test.py] checkpoint = {_args.checkpoint}")
+    print(f"[test.py] data-dir   = {_args.data_dir}")
+    print(f"[test.py] output-dir = {_args.output_dir}")
+    print(f"[test.py] years      = {_args.start_year}-{_args.end_year}")
+
     test_model_batch(
-        data_dir=data_directory, 
-        checkpoint_path=checkpoint_path, 
-        start_year=2005, 
-        end_year=2005,
-        output_dir=output_directory
-    ) 
+        data_dir=_args.data_dir,
+        checkpoint_path=_args.checkpoint,
+        start_year=_args.start_year,
+        end_year=_args.end_year,
+        output_dir=_args.output_dir,
+        skip_existing=not _args.force_reprocess,
+        start_month=_args.start_month,
+        end_month=_args.end_month,
+    )

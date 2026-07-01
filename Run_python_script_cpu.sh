@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=precompute_tensors
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=16
 #SBATCH --cpus-per-task=1
-#SBATCH --time=40:00:00
+#SBATCH --time=20:00:00
 #SBATCH --partition=batch
 #SBATCH --account=cli138
 #SBATCH --output=job_%j.out
@@ -28,12 +28,20 @@ echo "Total MPI ranks: $SLURM_NTASKS"
 echo "Tasks per node:  $SLURM_NTASKS_PER_NODE"
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-srun --ntasks=$SLURM_NTASKS \
-     --cpus-per-task=1 \
-     python precompute_tensors.py \
-         --start_year 1980 \
-         --end_year 2024 \
-         --tensor_dir /lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/tensor_cache_v2
+# srun --ntasks=$SLURM_NTASKS \
+#      --cpus-per-task=1 \
+#      python precompute_tensors.py \
+#          --start_year 1980 \
+#          --end_year 2024 \
+#          --tensor_dir /lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/tensor_cache_v2
+
+# python -u mcs-wnet-newfinalcode.py
+
+# python -u build_iwv_climatology.py
+
+python -u apply_min_area.py 1995
+
+# python -u mcs-wnet-newfinalcode.py
 
 
 echo "Finished at $(date)"

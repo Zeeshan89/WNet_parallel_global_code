@@ -14,7 +14,21 @@ from datetime import datetime
 
 sns.set_style("darkgrid")
 plt.rcParams['figure.figsize'] = (16, 12)
-plt.rcParams['font.size'] = 10
+plt.rcParams.update({
+    "font.size":        12,
+    "axes.titlesize":   13,
+    "axes.labelsize":   12,
+    "legend.fontsize":  11,
+    "xtick.labelsize":  12,
+    "ytick.labelsize":  12,
+    "figure.titlesize": 14,
+    "pdf.fonttype":     42,   # editable text in vector PDF
+    "savefig.dpi":      300,
+})
+
+# Distinct markers per storm class, so lines are differentiable in print/grayscale
+CLASS_MARKERS = {"ar": "o", "hurricane": "s", "etc": "^", "mcs": "D",
+                 "total": "*", "overlap": "v"}
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR    = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
@@ -23,6 +37,15 @@ BASE_DIR    = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
 HISTORY_PKL = os.path.join(BASE_DIR, "loss_history.pkl")
 OUTPUT_DIR  = os.path.join(BASE_DIR, "loss_plots")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def _save(name):
+    """Save the current figure as both high-res PNG and vector PDF, then close."""
+    for ext in ("png", "pdf"):
+        out = os.path.join(OUTPUT_DIR, f"{name}.{ext}")
+        plt.savefig(out, dpi=300, bbox_inches="tight")
+        print(f"Saved: {out}")
+    plt.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,10 +124,11 @@ def _file_label(fname):
         return fname
 
 
-def _add_file_shading(ax, boundaries, file_names, values):
+def _add_file_shading(ax, boundaries, file_names, values, show_labels=False):
     """
-    Shade alternating file blocks and add date labels at the top.
-    Called after the main plot so y-limits are already set.
+    Shade alternating file blocks. Optionally annotate each block with its
+    YYYYMM label at the top (off by default — the labels clutter the figure
+    and are not needed for the paper).
     """
     ymin, ymax = ax.get_ylim()
     n = len(values)
@@ -112,10 +136,11 @@ def _add_file_shading(ax, boundaries, file_names, values):
         b_end = boundaries[i + 1] if i + 1 < len(boundaries) else n
         if i % 2 == 0:
             ax.axvspan(b_start, b_end, alpha=0.07, color="gray", zorder=0)
-        label = _file_label(file_names[i]) if i < len(file_names) else str(i)
-        ax.text((b_start + b_end) / 2, ymax,
-                label, fontsize=5, ha="center", va="bottom",
-                rotation=90, color="dimgray")
+        if show_labels:
+            label = _file_label(file_names[i]) if i < len(file_names) else str(i)
+            ax.text((b_start + b_end) / 2, ymax,
+                    label, fontsize=5, ha="center", va="bottom",
+                    rotation=90, color="dimgray")
 
 
 def _smooth(values, window):
@@ -166,17 +191,14 @@ def plot_overall_training_loss(history):
         ax.axvline(b, color="black", linewidth=0.6, linestyle="--", alpha=0.4)
 
     ax.set_yscale("log")
-    ax.set_xlabel("Epoch (all files concatenated)", fontsize=12)
+    ax.set_xlabel("Epochs", fontsize=12)
     ax.set_ylabel("Total Loss (log scale)", fontsize=12)
-    ax.set_title("Overall Training Loss Across All Monthly Files", fontsize=14, fontweight="bold")
-    ax.legend(fontsize=10)
+    ax.set_title("Overall Training Loss Across All Monthly Files", fontsize=13, fontweight="bold")
+    ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    out = os.path.join(OUTPUT_DIR, "overall_training_loss.png")
-    plt.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {out}")
+    _save("overall_training_loss")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,7 +226,10 @@ def plot_individual_storm_losses(history):
             continue
 
         x = np.arange(len(values))
-        ax.plot(x, values, linewidth=0.8, color=color, alpha=0.8)
+        marker = CLASS_MARKERS.get(key, "o")
+        me = max(1, len(values) // 18)
+        ax.plot(x, values, linewidth=0.8, color=color, alpha=0.8,
+                marker=marker, markevery=me, markersize=5)
 
         window = max(5, len(values) // 40)
         smoothed = _smooth(values, window)
@@ -217,19 +242,16 @@ def plot_individual_storm_losses(history):
             ax.axvline(b, color="black", linewidth=0.5, linestyle="--", alpha=0.35)
 
         ax.set_yscale("log")
-        ax.set_xlabel("Epoch", fontsize=10)
-        ax.set_ylabel("Loss (log scale)", fontsize=10)
-        ax.set_title(title, fontsize=12, fontweight="bold")
-        ax.legend(fontsize=9)
+        ax.set_xlabel("Epochs", fontsize=12)
+        ax.set_ylabel("Loss (log scale)", fontsize=12)
+        ax.set_title(title, fontsize=13, fontweight="bold")
+        ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
 
     fig.suptitle("Individual Storm Type Losses Over Training",
                  fontsize=14, fontweight="bold")
     plt.tight_layout()
-    out = os.path.join(OUTPUT_DIR, "individual_storm_losses.png")
-    plt.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {out}")
+    _save("individual_storm_losses")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,28 +273,28 @@ def plot_loss_comparison(history):
 
     fig, ax = plt.subplots(figsize=(18, 7))
 
+    n = len(history["total"])
+    me = max(1, n // 20)   # space markers out so lines stay readable
     for key, label, color, lw in cfg:
         values = history.get(key, [])
         if values:
             ax.plot(np.arange(len(values)), values,
-                    linewidth=lw, color=color, alpha=0.8, label=label)
+                    linewidth=lw, color=color, alpha=0.85, label=label,
+                    marker=CLASS_MARKERS.get(key, "o"),
+                    markevery=me, markersize=6)
 
+    # alternating file shading only (no file-number annotations)
     _add_file_shading(ax, boundaries, file_names, history["total"])
-    for b in boundaries[1:]:
-        ax.axvline(b, color="black", linewidth=0.6, linestyle="--", alpha=0.35)
 
     ax.set_yscale("log")
-    ax.set_xlabel("Epoch (all files concatenated)", fontsize=12)
+    ax.set_xlabel("Epochs", fontsize=12)
     ax.set_ylabel("Loss (log scale)", fontsize=12)
-    ax.set_title("All Loss Components During Training", fontsize=14, fontweight="bold")
-    ax.legend(fontsize=10, loc="upper right")
+    ax.set_title("All Loss Components During Training", fontsize=13, fontweight="bold")
+    ax.legend(fontsize=11, loc="upper right")
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    out = os.path.join(OUTPUT_DIR, "loss_components_comparison.png")
-    plt.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {out}")
+    _save("loss_components_comparison")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,7 +345,9 @@ def plot_losses_by_epoch(history):
         std  = mat.std(axis=0)
         x    = np.arange(1, epochs_per_file + 1)
 
-        ax.plot(x, mean, linewidth=2.2, color=color, label="Mean across files")
+        marker = CLASS_MARKERS.get(key, "o")
+        ax.plot(x, mean, linewidth=2.2, color=color, label="Mean across files",
+                marker=marker, markersize=6)
         ax.fill_between(x, mean - std, mean + std, alpha=0.18, color=color,
                         label="±1 std")
 
@@ -331,19 +355,16 @@ def plot_losses_by_epoch(history):
         for row in mat:
             ax.plot(x, row, linewidth=0.4, color=color, alpha=0.25)
 
-        ax.set_xlabel("Epoch within file", fontsize=10)
-        ax.set_ylabel("Loss", fontsize=10)
-        ax.set_title(f"{title} — avg over {len(arr)} files", fontsize=11, fontweight="bold")
-        ax.legend(fontsize=9)
+        ax.set_xlabel("Epoch within file", fontsize=12)
+        ax.set_ylabel("Loss", fontsize=12)
+        ax.set_title(f"{title} — avg over {len(arr)} files", fontsize=13, fontweight="bold")
+        ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
 
     fig.suptitle("Average Loss per Epoch (averaged across all monthly files)",
                  fontsize=14, fontweight="bold")
     plt.tight_layout()
-    out = os.path.join(OUTPUT_DIR, "losses_by_epoch.png")
-    plt.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {out}")
+    _save("losses_by_epoch")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -385,10 +406,10 @@ def plot_per_file_final_loss(history):
         vals = final_losses[key]
         ax.bar(x, vals, color=color, alpha=0.75, edgecolor="black", linewidth=0.4)
         ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=90, fontsize=6)
-        ax.set_ylabel("Final Epoch Loss", fontsize=10)
+        ax.set_xticklabels(labels, rotation=90, fontsize=7)
+        ax.set_ylabel("Final Epoch Loss", fontsize=12)
         ax.set_title(f"{key.upper()} — final loss per file",
-                     fontsize=11, fontweight="bold")
+                     fontsize=13, fontweight="bold")
         ax.grid(True, alpha=0.3, axis="y")
 
         # Highlight worst file
@@ -396,15 +417,12 @@ def plot_per_file_final_loss(history):
             worst_idx = np.nanargmax(vals)
             ax.bar(worst_idx, vals[worst_idx], color="red", alpha=0.9,
                    edgecolor="black", linewidth=0.6, label=f"Worst: {labels[worst_idx]}")
-            ax.legend(fontsize=8)
+            ax.legend(fontsize=11)
 
     fig.suptitle("Final Epoch Loss per Monthly File",
                  fontsize=14, fontweight="bold")
     plt.tight_layout()
-    out = os.path.join(OUTPUT_DIR, "per_file_final_loss.png")
-    plt.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {out}")
+    _save("per_file_final_loss")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -460,15 +478,12 @@ def plot_monthly_loss_variation(history):
     ax.set_xlabel("Calendar Month", fontsize=12)
     ax.set_ylabel("Average Loss", fontsize=12)
     ax.set_title("Seasonal Variation in Storm Detection Losses",
-                 fontsize=14, fontweight="bold")
+                 fontsize=13, fontweight="bold")
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    out = os.path.join(OUTPUT_DIR, "monthly_loss_variation.png")
-    plt.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {out}")
+    _save("monthly_loss_variation")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -493,16 +508,16 @@ def plot_loss_statistics(history):
         ax.hist(arr, bins=40, color=color, alpha=0.72, edgecolor="black", linewidth=0.4)
         ax.axvline(arr.mean(), color="red",   linewidth=1.6, linestyle="--", label="Mean")
         ax.axvline(np.median(arr), color="gold", linewidth=1.6, linestyle=":",  label="Median")
-        ax.set_xlabel("Loss Value", fontsize=10)
-        ax.set_ylabel("Frequency",  fontsize=10)
-        ax.set_title(f"{key.upper()} Distribution", fontsize=11, fontweight="bold")
-        ax.legend(fontsize=9)
+        ax.set_xlabel("Loss Value", fontsize=12)
+        ax.set_ylabel("Frequency",  fontsize=12)
+        ax.set_title(f"{key.upper()} Distribution", fontsize=13, fontweight="bold")
+        ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
 
         ax.text(0.97, 0.96,
                 f"μ={arr.mean():.4f}\nσ={arr.std():.4f}\n"
                 f"min={arr.min():.4f}\nmax={arr.max():.4f}",
-                transform=ax.transAxes, fontsize=8,
+                transform=ax.transAxes, fontsize=11,
                 va="top", ha="right",
                 bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
 
@@ -513,10 +528,7 @@ def plot_loss_statistics(history):
 
     fig.suptitle("Loss Distributions", fontsize=14, fontweight="bold")
     plt.tight_layout()
-    out = os.path.join(OUTPUT_DIR, "loss_statistics.png")
-    plt.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {out}")
+    _save("loss_statistics")
 
     # Print stats table to console as well
     header = f"{'Type':<12} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10} {'Median':>10}"
@@ -563,23 +575,21 @@ def plot_val_metrics(history):
         for skey, slabel, color in storm_cfg:
             ykey = f"{skey}_{mkey}"
             vals = [v["metrics"].get(ykey, np.nan) for v in val]
-            ax.plot(epochs, vals, marker="o", markersize=5,
-                    linewidth=1.8, color=color, label=slabel)
-        ax.set_xlabel("Global epoch", fontsize=11)
-        ax.set_ylabel(mtitle, fontsize=11)
+            ax.plot(epochs, vals, marker=CLASS_MARKERS.get(skey, "o"),
+                    markersize=6, linewidth=1.8, color=color, label=slabel)
+        ax.set_xlabel("Epochs", fontsize=12)
+        ax.set_ylabel(mtitle, fontsize=12)
         ax.set_title(f"Held-out Val {mtitle} per Storm Class",
-                     fontsize=12, fontweight="bold")
+                     fontsize=13, fontweight="bold")
         ax.set_ylim(0, 1)
-        ax.legend(fontsize=10)
+        ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
 
-    fig.suptitle("Held-out Validation Metrics Across Passes",
-                 fontsize=14, fontweight="bold")
+    # Overall figure title removed for the paper figure
+    # fig.suptitle("Held-out Validation Metrics Across Passes",
+    #              fontsize=14, fontweight="bold")
     plt.tight_layout()
-    out = os.path.join(OUTPUT_DIR, "val_metrics.png")
-    plt.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {out}")
+    _save("val_metrics")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -618,37 +628,26 @@ def plot_train_loss_vs_val_iou(history):
                     color=color, alpha=0.55, linewidth=0.9, label="Train loss")
             ax.set_yscale("log")
             ax.set_ylabel(f"{slabel} train loss (log)",
-                          fontsize=11, color=color)
+                          fontsize=12, color=color)
             ax.tick_params(axis="y", labelcolor=color)
-        ax.set_xlabel("Global epoch", fontsize=11)
+        ax.set_xlabel("Epochs", fontsize=12)
         ax.grid(True, alpha=0.3)
 
         ax2 = ax.twinx()
-        ax2.plot(val_epochs, val_iou, marker="o", markersize=6, linewidth=2.0,
-                 color="black", label="Val IoU")
-        ax2.set_ylabel(f"{slabel} val IoU", fontsize=11)
+        ax2.plot(val_epochs, val_iou, marker=CLASS_MARKERS.get(skey, "o"),
+                 markersize=6, linewidth=2.0, color="black", label="Val IoU")
+        ax2.set_ylabel(f"{slabel} val IoU", fontsize=12)
         ax2.set_ylim(0, 1)
 
-        if val_iou and not all(np.isnan(val_iou)):
-            best_i = int(np.nanargmax(val_iou))
-            ax2.axvline(val_epochs[best_i], color="gold", linewidth=1.6,
-                        linestyle=":", alpha=0.85,
-                        label=f"Best val IoU @ epoch {val_epochs[best_i]} "
-                              f"({val_iou[best_i]:.3f})")
-
         ax.set_title(f"{slabel} — train loss vs held-out val IoU",
-                     fontsize=12, fontweight="bold")
+                     fontsize=13, fontweight="bold")
         h1, l1 = ax.get_legend_handles_labels()
         h2, l2 = ax2.get_legend_handles_labels()
-        ax.legend(h1 + h2, l1 + l2, fontsize=9, loc="upper right")
+        ax.legend(h1 + h2, l1 + l2, fontsize=11, loc="upper right")
 
-    fig.suptitle("Train Loss vs Held-out Val IoU — Overfitting Diagnostic",
-                 fontsize=14, fontweight="bold")
+    # Overall figure title removed for the paper figure
     plt.tight_layout()
-    out = os.path.join(OUTPUT_DIR, "train_loss_vs_val_iou.png")
-    plt.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {out}")
+    _save("train_loss_vs_val_iou")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

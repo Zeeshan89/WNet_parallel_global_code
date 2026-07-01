@@ -51,9 +51,13 @@ class ARDatasetImproved(Dataset):
                 global_percentiles: Optional[Dict[str, xr.DataArray]] = None,
                 global_stats: Optional[Dict[str, Dict[str, float]]] = None,  
                 precompute: bool = True,
-                mslp_climatology: Optional[np.ndarray] = None, 
+                mslp_climatology: Optional[np.ndarray] = None,
+                iwv_climatology: Optional[np.ndarray] = None,
+                mcs_moisture_mode: str = "anomaly",
+                iwv_anom_threshold: float = 0.0,
+                iwv_anom_soft_band: float = 5.0,
                 ibtracs_lookup: Optional[dict] = None,
-                year=None, 
+                year=None,
                 month=None
                 ):
         """
@@ -197,6 +201,18 @@ class ARDatasetImproved(Dataset):
         else:
             print("⚠ No MSLP climatology provided — Condition ii disabled")
             self.mslp_clim = None
+
+        # IWV monthly climatology → anomaly-based MCS moisture gate (Option 1).
+        # mirrors the MSLP climatology plumbing above. (12, H, W) on the data grid.
+        self.mcs_moisture_mode = mcs_moisture_mode      # "anomaly" | "anomaly_soft" | "absolute"
+        self.iwv_anom_threshold = float(iwv_anom_threshold)
+        self.iwv_anom_soft_band = float(iwv_anom_soft_band)
+        if iwv_climatology is not None:
+            print(f"Using pre-aligned IWV monthly climatology — MCS moisture gate = '{mcs_moisture_mode}'")
+            self.iwv_clim = self._convert_to_numpy(iwv_climatology, dtype=np.float32)
+        else:
+            print("⚠ No IWV climatology provided — MCS moisture gate falls back to ABSOLUTE IWV")
+            self.iwv_clim = None
 
         # Ground truth handling
         self.has_ground_truth = ars is not None
@@ -834,6 +850,23 @@ class ARDatasetImproved(Dataset):
         clim_field = self.mslp_clim[month_idx]       # (H, W)
         anomaly    = self.mslp[idx] - clim_field      # negative = below climatology
         return anomaly
+
+    def _compute_iwv_anomaly(self, idx: int) -> np.ndarray:
+        """IWV anomaly (mm) vs the monthly climatology for this sample's calendar month.
+
+        Each monthly file shares one month, so the climatology slice is constant
+        across the file. Returns zeros if no climatology was provided.
+        """
+        if self.iwv_clim is None:
+            return np.zeros_like(self.iwv[idx])
+        month_idx = int(pd.Timestamp(self.time[idx]).month) - 1   # 0-indexed
+        clim_field = self.iwv_clim[month_idx]
+        if clim_field.shape != self.iwv[idx].shape:
+            from scipy.ndimage import zoom
+            zf = (self.iwv[idx].shape[0] / clim_field.shape[0],
+                  self.iwv[idx].shape[1] / clim_field.shape[1])
+            clim_field = zoom(clim_field, zf, order=1)
+        return self.iwv[idx] - clim_field
 
     def _detect_mslp_local_minima(self, mslp_field: np.ndarray, 
                                     pressure_diff_threshold: float = 150.0,
@@ -1618,6 +1651,9 @@ class ARDatasetImproved(Dataset):
         spring_fall_months = [3, 4, 5, 9, 10, 11]
         
         # Set seasonal parameters
+        # NOTE: moisture_threshold is the LEGACY absolute-IWV gate (used only when
+        # no IWV climatology is supplied). moisture_anom_threshold is the IWV-anomaly
+        # gate (mm above the monthly climatology) used by Option 1; tunable per season.
         if month in summer_months:
             # SUMMER: Smaller, intense systems
             params = {
@@ -1625,7 +1661,8 @@ class ARDatasetImproved(Dataset):
                 'min_core_pixels': 3,         # Compact intense cores
                 'bt_boundary': 241.0,         # Standard boundary
                 'bt_core': 223.0,             # STRICTER core (was 225K)
-                'moisture_threshold': 0.5,    # Higher moisture requirement
+                'moisture_threshold': 0.5,    # legacy absolute gate
+                'moisture_anom_threshold': 2.0,   # require above-normal moisture in summer
                 'shear_threshold': 0.6,       # Favorable shear needed
                 'season': 'summer'
             }
@@ -1636,7 +1673,8 @@ class ARDatasetImproved(Dataset):
                 'min_core_pixels': 8,         # Larger cores
                 'bt_boundary': 241.0,         # Standard boundary
                 'bt_core': 228.0,             # RELAXED core (was 225K)
-                'moisture_threshold': 0.3,    # Lower moisture (drier winter)
+                'moisture_threshold': 0.3,    # legacy absolute gate
+                'moisture_anom_threshold': -2.0,  # allow near/slightly-below-normal (cold, dry season)
                 'shear_threshold': 0.4,       # More lenient shear
                 'season': 'winter'
             }
@@ -1647,7 +1685,8 @@ class ARDatasetImproved(Dataset):
                 'min_core_pixels': 5,         # Medium cores
                 'bt_boundary': 241.0,         # Standard boundary
                 'bt_core': 225.0,             # Standard core
-                'moisture_threshold': 0.4,    # Moderate moisture
+                'moisture_threshold': 0.4,    # legacy absolute gate
+                'moisture_anom_threshold': 0.0,   # above-normal moisture
                 'shear_threshold': 0.5,       # Moderate shear
                 'season': 'transition'
             }
@@ -1707,9 +1746,26 @@ class ARDatasetImproved(Dataset):
         # 3. MOISTURE ASSESSMENT
         # ============================
         moisture_score = self._calculate_moisture_score(self.iwv[idx])
-        
-        # Use seasonal moisture threshold
-        mcs_seasonal_moisture = (moisture_score >= moisture_thresh_seasonal).astype(np.float32)
+
+        # --- Seasonal moisture gate (Option 1: IWV anomaly) -----------------------
+        # Absolute-IWV gating erases cool-season MCS (winter IWV << summer). Use the
+        # IWV anomaly vs monthly climatology instead: "moist FOR THE SEASON".
+        #   mode "anomaly"      -> hard gate  (anomaly >= threshold)
+        #   mode "anomaly_soft" -> soft weight in [0,1] across a band around threshold
+        #   mode "absolute" or no climatology -> legacy absolute-IWV behaviour
+        use_anom = (self.iwv_clim is not None) and (self.mcs_moisture_mode in ("anomaly", "anomaly_soft"))
+        if use_anom:
+            iwv_anom = self._compute_iwv_anomaly(idx)
+            anom_thr = seasonal_params.get('moisture_anom_threshold', self.iwv_anom_threshold)
+            if self.mcs_moisture_mode == "anomaly_soft":
+                lo = anom_thr - self.iwv_anom_soft_band
+                hi = anom_thr + self.iwv_anom_soft_band
+                mcs_seasonal_moisture = np.clip((iwv_anom - lo) / (hi - lo + 1e-6), 0.0, 1.0).astype(np.float32)
+            else:
+                mcs_seasonal_moisture = (iwv_anom >= anom_thr).astype(np.float32)
+        else:
+            # Legacy absolute-IWV gate
+            mcs_seasonal_moisture = (moisture_score >= moisture_thresh_seasonal).astype(np.float32)
         
         # Also keep standard thresholds for reference
         mcs_high_moisture = (moisture_score >= 0.7).astype(np.float32)

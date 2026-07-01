@@ -16,6 +16,215 @@ import torch.nn.functional as F
 from skimage.transform import resize
 
 
+# =============================================================================
+# MCS-ONLY POST-PROCESSING
+#   Raw model blobs (no physics/model filtering) → minimum cloud-shield area
+#   (60,000 km²) → temporal-overlap persistence (50–90% with prev/next frame).
+#   Applied to the full monthly (time, lat, lon) stack in test.py.
+# =============================================================================
+_EARTH_R_KM = 6371.0
+
+
+def _pixel_area_km2(latitudes, longitudes):
+    """Per-grid-cell area (km²) on a regular lat/lon grid, latitude-weighted.
+
+    cell_area(lat) = R² · Δlon_rad · Δlat_rad · cos(lat)
+    Returned as a 2-D (nlat, nlon) array (longitude-independent, broadcast).
+    cos() makes the result invariant to ascending/descending latitude order.
+    """
+    lats = np.asarray(latitudes, dtype=np.float64)
+    lons = np.asarray(longitudes, dtype=np.float64)
+    dlat_deg = np.abs(np.mean(np.diff(lats))) if lats.size > 1 else 0.25
+    dlon_deg = np.abs(np.mean(np.diff(lons))) if lons.size > 1 else 0.25
+    dlat_rad = np.deg2rad(dlat_deg)
+    dlon_rad = np.deg2rad(dlon_deg)
+    cell_per_lat = (_EARTH_R_KM ** 2) * dlon_rad * dlat_rad * np.cos(np.deg2rad(lats))
+    cell_per_lat = np.clip(cell_per_lat, 0.0, None)        # guard tiny negatives at |lat|→90
+    return np.repeat(cell_per_lat[:, None], lons.size, axis=1).astype(np.float32)
+
+
+def _label_lonwrap(binary):
+    """8-connected labeling that merges blobs across the ±180° longitude seam.
+
+    The output grid's first and last columns are physically adjacent, so a blob
+    straddling the antimeridian is otherwise split in two. Mirrors the union-find
+    merge in evaluations/ar_mars_eval/build_ar_object_metrics.py:label_wrap.
+    Returns (labels, n_unique).
+    """
+    structure = np.ones((3, 3), dtype=int)
+    labels, n = ndimage.label(binary, structure=structure)
+    if n <= 1:
+        return labels, n
+
+    left, right = labels[:, 0], labels[:, -1]
+    pairs = set()
+    for i in range(labels.shape[0]):
+        l, r = left[i], right[i]
+        if l > 0 and r > 0 and l != r:
+            pairs.add((min(l, r), max(l, r)))
+    if not pairs:
+        return labels, n
+
+    parent = list(range(n + 1))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in pairs:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    roots = np.array([find(x) for x in range(n + 1)])
+    uniq = sorted(set(roots[1:].tolist()))
+    remap = {old: new for new, old in enumerate(uniq, start=1)}
+    out = np.zeros_like(labels)
+    for x in range(1, n + 1):
+        out[labels == x] = remap[roots[x]]
+    return out, len(uniq)
+
+
+def _filter_min_area(mask2d, area2d, min_area_km2):
+    """Drop connected blobs whose total (latitude-weighted) area < min_area_km2."""
+    binary = mask2d > 0
+    labels, n = _label_lonwrap(binary)
+    if n == 0:
+        return np.zeros_like(binary, dtype=np.float32)
+    ids = np.arange(1, n + 1)
+    areas = ndimage.sum(area2d, labels, ids)
+    keep_ids = ids[np.asarray(areas) >= min_area_km2]
+    if keep_ids.size == 0:
+        return np.zeros_like(binary, dtype=np.float32)
+    return np.isin(labels, keep_ids).astype(np.float32)
+
+
+def track_mcs_timeseries(mcs_stack, latitudes, longitudes,
+                         min_area_km2=60000.0, link_overlap=0.5,
+                         min_lifetime_steps=2, verbose=True):
+    """Full MCS criteria + overlap tracking → a storm-ID field (like Feng's
+    `cloudtracknumber`), so the SHARED benchmark metric code can compute true
+    ID-based storm-hours for WNet exactly as for the other methods.
+
+    Applied to a monthly (time, lat, lon) stack of RAW model MCS blobs:
+      1. Minimum cloud-shield area: drop blobs < `min_area_km2` per frame
+         (latitude-weighted area; ±180° seam merged via `_label_lonwrap`).
+      2. Overlap tracking: a blob at t inherits the ID of the previous-frame blob
+         it overlaps most, when that overlap (intersection / area of the SMALLER
+         of the two blobs) ≥ `link_overlap`; otherwise it starts a new track ID.
+         Merges/splits resolve to the maximum-overlap parent.
+      3. Minimum lifetime: drop whole tracks present in fewer than
+         `min_lifetime_steps` frames (2 ≈ 6 h at 6-hourly cadence).
+
+    Tracking is per monthly file; IDs restart each month. That is sufficient for
+    the monthly storm-hours metric (it groups by (month, id)); a system crossing
+    a month boundary is counted in each month regardless.
+
+    Args:
+        mcs_stack : (T, H, W) array of raw MCS detections (0/1).
+        latitudes, longitudes : 1-D coordinate arrays of the output grid.
+    Returns:
+        (binary, ids) where
+          binary : (T, H, W) float32, 1 where a surviving track is present.
+          ids    : (T, H, W) int32, storm track ID per pixel (0 = none).
+    """
+    stack = np.asarray(mcs_stack)
+    if stack.ndim != 3:
+        raise ValueError(f"mcs_stack must be (T, H, W); got shape {stack.shape}")
+    T, H, W = stack.shape
+    area2d = _pixel_area_km2(latitudes, longitudes)   # used for area-weighted overlap below
+
+    # ── Step 1: optional per-frame minimum-area filter ───────────────────────
+    # min_area_km2 None/0 → keep RAW model blobs (no area criterion).
+    if min_area_km2 and min_area_km2 > 0:
+        binar = np.zeros((T, H, W), dtype=np.uint8)
+        for t in range(T):
+            binar[t] = (_filter_min_area(stack[t], area2d, min_area_km2) > 0).astype(np.uint8)
+    else:
+        binar = (stack > 0).astype(np.uint8)
+
+    # ── Step 2: overlap-based temporal linking → global track IDs ─────────────
+    ids = np.zeros((T, H, W), dtype=np.int32)
+    next_id = 1
+    prev_ids = None                                  # previous frame's global-ID field
+    for t in range(T):
+        lab, n = _label_lonwrap(binar[t] > 0)
+        out_t = np.zeros((H, W), dtype=np.int32)
+        if n == 0:
+            ids[t] = out_t
+            prev_ids = out_t
+            continue
+
+        cur_idx = np.arange(1, n + 1)
+        cur_area = np.asarray(ndimage.sum(area2d, lab, cur_idx), dtype=np.float64)
+
+        assigned = {}                                # current label -> global id
+        if prev_ids is not None and prev_ids.max() > 0:
+            pu = np.unique(prev_ids)
+            pu = pu[pu > 0]
+            prev_area = dict(zip(pu.tolist(),
+                                 np.asarray(ndimage.sum(area2d, prev_ids, pu), dtype=np.float64)))
+
+            overlap = lab > 0
+            overlap &= prev_ids > 0
+            if overlap.any():
+                cf = lab[overlap].astype(np.int64)
+                pf = prev_ids[overlap].astype(np.int64)
+                af = area2d[overlap]
+                base = int(prev_ids.max()) + 1
+                key = cf * base + pf
+                uk, inv = np.unique(key, return_inverse=True)
+                inter = np.zeros(len(uk), dtype=np.float64)
+                np.add.at(inter, inv, af)
+                best = {}                            # cur label -> (inter_area, prev_id)
+                for k, ia in zip(uk.tolist(), inter):
+                    c = k // base
+                    p = k % base
+                    if c not in best or ia > best[c][0]:
+                        best[c] = (ia, p)
+                for c, (ia, p) in best.items():
+                    denom = min(cur_area[c - 1], prev_area[p])
+                    if denom > 0 and (ia / denom) >= link_overlap:
+                        assigned[c] = int(p)
+
+        for c in cur_idx:
+            gid = assigned.get(int(c))
+            if gid is None:
+                gid = next_id
+                next_id += 1
+            out_t[lab == c] = gid
+
+        ids[t] = out_t
+        prev_ids = out_t
+
+    # ── Step 3: minimum-lifetime filter (drop short-lived tracks) ─────────────
+    if min_lifetime_steps > 1 and next_id > 1:
+        life = np.zeros(next_id, dtype=np.int32)     # frames each ID appears in
+        for t in range(T):
+            u = np.unique(ids[t])
+            u = u[u > 0]
+            life[u] += 1
+        short = np.nonzero(life < min_lifetime_steps)[0]
+        if short.size:
+            drop = np.isin(ids, short)
+            ids[drop] = 0
+
+    binary = (ids > 0).astype(np.float32)
+
+    if verbose:
+        n_tracks = int(np.unique(ids[ids > 0]).size)
+        area_txt = (f"{min_area_km2:.0f} km² area + " if (min_area_km2 and min_area_km2 > 0)
+                    else "no area filter, ")
+        life_txt = (f"{min_lifetime_steps}-step lifetime"
+                    if min_lifetime_steps and min_lifetime_steps > 1 else "no lifetime filter")
+        print(f"[MCS] raw pixels: {int((stack > 0).sum())} -> "
+              f"{area_txt}overlap-track + {life_txt}: {int((binary > 0).sum())} pixels, "
+              f"{n_tracks} tracks")
+    return binary, ids
+
+
 def _to_numpy_float32(arr):
     """
     Safely convert any array-like (torch.Tensor, xarray, object array, etc.)
