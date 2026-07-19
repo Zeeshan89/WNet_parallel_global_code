@@ -149,6 +149,8 @@ def train_wnet_improved(
             epoch_mcs_loss     = 0.0
             epoch_overlap_loss = 0.0
             batch_count        = 0
+            n_nonfinite_steps   = 0   # optimizer steps skipped (non-finite grads)
+            n_nonfinite_batches = 0   # batches excluded from the logged averages
 
             # No DistributedSampler → no set_epoch needed
             optimizer.zero_grad()
@@ -167,28 +169,11 @@ def train_wnet_improved(
                 batch_start_time = time.time()
 
                 # ── Forward + loss ────────────────────────────────────────────
-                if scaler is not None:
-                    with autocast():
-                        seg_probs, rec = model(batch)
-                        _epoch_forward_time += time.time() - _t_fwd
-                        _t_bwd = time.time()
-
-                        loss_dict          = ar_loss(seg_probs, batch)
-                        segmentation_loss  = loss_dict["total_loss"]
-                        reconstruction_loss = rec_loss(rec, batch)
-
-                        rec_weight, seg_weight = _dynamic_weights(epoch, warmup_epochs, global_epoch_offset)
-
-                        total_loss = (
-                            seg_weight * segmentation_loss +
-                            rec_weight * reconstruction_loss
-                        ) / gradient_accumulation_steps
-
-                    scaler.scale(total_loss).backward()
-                    _epoch_backward_time += time.time() - _t_bwd
-                    _t_opt = time.time()
-
-                else:
+                # bf16 autocast: bfloat16 shares fp32's exponent range, so it can
+                # NOT overflow the way fp16 did — unet2 BatchNorm running_var grew
+                # to ~1e5 ≫ fp16 max 65504 → inf/NaN. bf16 needs no GradScaler
+                # (no fp16-style underflow), so we backward / step directly.
+                with autocast(dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
                     seg_probs, rec = model(batch)
                     _epoch_forward_time += time.time() - _t_fwd
                     _t_bwd = time.time()
@@ -203,23 +188,25 @@ def train_wnet_improved(
                         rec_weight * reconstruction_loss
                     ) / gradient_accumulation_steps
 
-                    total_loss.backward()
-                    _epoch_backward_time += time.time() - _t_bwd
-                    _t_opt = time.time()
+                # Always backward on EVERY rank so the DDP gradient all-reduce stays
+                # in lockstep even if this micro-batch were non-finite.
+                total_loss.backward()
+                _epoch_backward_time += time.time() - _t_bwd
+                _t_opt = time.time()
 
                 # ── Gradient accumulation step ────────────────────────────────
                 if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                    if scaler is not None:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    # Defensive non-finite guard: skip the optimizer + EMA update
+                    # when grads are non-finite (bf16 should prevent this). The skip
+                    # is a LOCAL decision; the collective backward already ran, so
+                    # DDP stays synchronised.
+                    if torch.isfinite(grad_norm):
                         optimizer.step()
-
+                        ema.update()
+                    else:
+                        n_nonfinite_steps += 1
                     _epoch_optim_time += time.time() - _t_opt
-                    ema.update()
                     optimizer.zero_grad()
 
                 _t_data = time.time()   # reset for next batch's data-load timing
@@ -235,13 +222,19 @@ def train_wnet_improved(
                 mcs_loss_val       = float(loss_dict["mcs_loss"].cpu())
                 overlap_loss_val   = float(loss_dict["overlap_loss"].cpu())
 
-                epoch_loss         += total_loss_val
-                epoch_ar_loss      += ar_loss_val
-                epoch_hurricane_loss += hurricane_loss_val
-                epoch_etc_loss     += etc_loss_val
-                epoch_mcs_loss     += mcs_loss_val
-                epoch_overlap_loss += overlap_loss_val
-                batch_count        += 1
+                # Fold only FINITE losses into the epoch averages so a single bad
+                # batch can never poison the logged curve/summary (which uses a
+                # plain mean and would otherwise report NaN for the whole run).
+                if np.isfinite(total_loss_val):
+                    epoch_loss         += total_loss_val
+                    epoch_ar_loss      += ar_loss_val
+                    epoch_hurricane_loss += hurricane_loss_val
+                    epoch_etc_loss     += etc_loss_val
+                    epoch_mcs_loss     += mcs_loss_val
+                    epoch_overlap_loss += overlap_loss_val
+                    batch_count        += 1
+                else:
+                    n_nonfinite_batches += 1
                 total_batches      += 1
 
                 if is_main_process and batch_idx % 10 == 0:
@@ -305,6 +298,10 @@ def train_wnet_improved(
                 print(f"  Epoch {epoch+1}/{num_epochs} done | "
                       f"avg_loss={avg_epoch_loss:.6f} | "
                       f"epoch_time={epoch_time:.1f}s | total={total_time:.1f}s")
+                if n_nonfinite_batches or n_nonfinite_steps:
+                    print(f"    ⚠ non-finite guard fired: {n_nonfinite_batches} batches "
+                          f"excluded from avg, {n_nonfinite_steps} optimizer steps skipped "
+                          f"(should be 0 with bf16)")
                 print(f"    AR:{avg_ar_loss:.6f} Hurr:{avg_hurricane_loss:.6f} "
                       f"ETC:{avg_etc_loss:.6f} MCS:{avg_mcs_loss:.6f} "
                       f"Overlap:{avg_overlap_loss:.6f}")
@@ -382,7 +379,7 @@ def validate_on_loader(
             for batch in val_loader:
                 batch = batch.to(device, non_blocking=True)
                 if use_amp and torch.cuda.is_available():
-                    with autocast():
+                    with autocast(dtype=torch.bfloat16):
                         seg_logits = seg_net(batch)
                         seg_probs  = F.softmax(seg_logits, dim=1)
                 else:
@@ -412,9 +409,13 @@ def _dynamic_weights(epoch: int, warmup_epochs: int, global_epoch_offset: int = 
 # Checkpoint helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-CHECKPOINT_DIR = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
-                  "Storms_precipitation_notebooks/WNet_parallel_global_code/"
-                  "ARs_Hurricanes_ETCs_MCS/Trail11")
+# Single source of truth, shared with main.py — do NOT re-derive this path here.
+# This module writes ema_checkpoint_epoch_*.pth. When its private copy of the path
+# drifted from main.py's (which had been repointed to the precip-MCS run), every
+# EMA checkpoint was silently written into the BT-era baseline Trail_RegCM_<MODEL>/,
+# overwriting the reference weights we A/B against.
+from utils import regcm_checkpoint_dir
+CHECKPOINT_DIR = regcm_checkpoint_dir()
 
 
 def _model_state(model, is_distributed):

@@ -105,7 +105,7 @@ class ImprovedUNet(nn.Module):
         return x
 
 class ImprovedWNet(nn.Module):
-    def __init__(self, in_channels, num_classes=5):
+    def __init__(self, in_channels, num_classes=5):  # RegCM: 5 classes (MCS on)
         super().__init__()
         self.unet1 = ImprovedUNet(in_channels, num_classes)
         self.unet2 = ImprovedUNet(num_classes, in_channels)

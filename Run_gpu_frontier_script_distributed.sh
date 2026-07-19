@@ -1,13 +1,13 @@
 #!/bin/bash -l
 #SBATCH --account CLI138
-#SBATCH -J Storms_dist_4node
+#SBATCH -J Storms_dist_8node
 #SBATCH -p batch
 #SBATCH --nodes=8
 #SBATCH --ntasks=64
 #SBATCH --ntasks-per-node=8
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=7
-#SBATCH --time=01:55:00
+#SBATCH --time=00:40:00
 #SBATCH -q normal
 #SBATCH -o logs/output-%j.txt
 #SBATCH -e logs/error-%j.txt
@@ -17,7 +17,8 @@
 
 # ═══════════════════════════════════════════════════════════════════
 # TRAINING MODE — set before submitting:
-#
+#   sbatch --export=MODE=single,START_YEAR=1980,END_YEAR=2004,REGCM_MODEL=ACC Run_gpu_frontier_script_distributed.sh
+
 #   MODE=single   → one job, all years at once (needs enough wall time)
 #   MODE=chain    → auto-submit next job when this one finishes
 #
@@ -105,8 +106,8 @@ fi
 export MASTER_PORT=3442
 
 # ── Dataset constants ─────────────────────────────────────────────
-FINAL_START_YEAR=2006
-FINAL_END_YEAR=2024
+FINAL_START_YEAR=1980
+FINAL_END_YEAR=2004
 YEARS_PER_JOB=7        # used in chain mode only
 
 # ── Mode defaults ─────────────────────────────────────────────────

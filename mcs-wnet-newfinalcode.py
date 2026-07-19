@@ -35,6 +35,7 @@ DASK NOTE:
 
 import os
 import glob
+import argparse
 import warnings
 from datetime import datetime
 
@@ -49,12 +50,40 @@ from scipy.ndimage import center_of_mass
 START_YEAR = 2004
 END_YEAR   = 2014
 
-MCS_DIR    = "/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/WNet_parallel_global_code/ARs_Hurricanes_ETCs_MCS/Output_new_IWV_60k/"
-PRECIP_DIR = "/lustre/orion/proj-shared/cli138/dr6/eventtype//Data/ERA5/input"  # expects ERA5_tp_input_{year}_6hourly_conus.nc
-OUTPUT_DIR = "outputs_wnet_standard_IWV_60k"
+# RegCM model outputs live under <MCS_ROOT>/Outputs_RegCM_<MODEL>/ with monthly files
+# named "<MODEL>dara_YYYYMM_MCS_detection*.nc". The model is selected on the command line.
+MCS_ROOT   = "/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/WNet_parallel_global_RegCM/ARs_Hurricanes_ETCs_MCS"
+KNOWN_MODELS = ["ACC", "BCC", "CNR", "MPI", "MRI", "NOR"]
 
-LAT_BOUNDS = (25.0, 50.99454)
-LON_BOUNDS = (-109.9899, -70.0101)
+PRECIP_DIR = "/lustre/orion/proj-shared/cli138/dr6/eventtype//Data/ERA5/input"  # expects ERA5_tp_input_{year}_6hourly_conus.nc
+
+# Per-model runtime settings — populated by configure_model() before processing.
+MODEL      = None
+MCS_DIR    = None
+OUTPUT_DIR = None
+WNET_PATTERN = None
+
+# Full RegCM/AR domain so MCS maps match the AR spatial coverage. The raw MCS
+# detection spans lat 18..56.75, lon -138.75..-57; ERA5 precip covers lon ~-135..-60,
+# so the precip inner-join naturally limits the effective longitude to that range
+# (latitude is unaffected). Set to the AR domain and let the align clip as needed.
+LAT_BOUNDS = (18.0, 56.75)
+LON_BOUNDS = (-138.75, -57.0)
+
+
+def configure_model(model: str, output_root: str = "."):
+    """Set the module-level MCS_DIR / OUTPUT_DIR / WNET_PATTERN for the given RegCM model."""
+    global MODEL, MCS_DIR, OUTPUT_DIR, WNET_PATTERN
+    MODEL = model
+    # Precip-based MCS inference from test.py lands in Outputs_RegCM_PR_<MODEL>.
+    # (Was Outputs_RegCM_PR_<MODEL> — a nonexistent dir; the BT-era baseline is
+    #  Outputs_RegCM_<MODEL>, without the _PR_.)
+    MCS_DIR = os.path.join(MCS_ROOT, f"Outputs_RegCM_PR_{model}")
+    OUTPUT_DIR = os.path.join(output_root, f"outputs_wnet_PR_{model}")
+    WNET_PATTERN = f"{model}dara_{{year}}{{month:02d}}_MCS_detection*.nc"
+    if not os.path.isdir(MCS_DIR):
+        raise FileNotFoundError(f"Model input directory not found: {MCS_DIR}")
+    return MCS_DIR, OUTPUT_DIR
 
 
 
@@ -113,14 +142,15 @@ def safe_scalar(x):
 # -----------------------
 # Open WNet monthly -> yearly
 # -----------------------
-def open_wnet_year(mcs_dir: str, year: int,
-                   pattern: str = "era5dara_{year}{month:02d}_MCS_detection*.nc") -> xr.Dataset:
+def open_wnet_year(mcs_dir: str, year: int, pattern: str = None) -> xr.Dataset:
     """Assemble a year from monthly WNet MCS files, carrying the tracked MCS_id.
 
     MCS_id restarts at 1 in each monthly file, so we offset each month's nonzero
     IDs by the running max to make them UNIQUE across the year (needed for correct
     per-track summaries; the monthly storm-hours metric groups by month anyway).
     """
+    if pattern is None:
+        pattern = WNET_PATTERN
     monthly = []
     id_offset = 0
     for m in range(1, 13):
@@ -401,10 +431,38 @@ def process_year(year: int):
 
     print(f"  Saved {ydir} | dt_hours={dt_hours:.2f} | domain_days={domain_days}")
 
-def main():
+def process_model(model: str, start_year: int, end_year: int, output_root: str):
+    mcs_dir, out_dir = configure_model(model, output_root)
+    print(f"\n========== RegCM model {model} ==========")
+    print(f"  input : {mcs_dir}")
+    print(f"  output: {out_dir}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    for y in range(START_YEAR, END_YEAR + 1):
+    for y in range(start_year, end_year + 1):
         process_year(y)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="WNet (6-hourly) MCS processing for one or more RegCM models. "
+                    "Reads <MCS_ROOT>/Outputs_RegCM_PR_<MODEL>/ and writes outputs_wnet_standard_<MODEL>/.")
+    p.add_argument("models", nargs="+",
+                   help=f"RegCM model name(s), e.g. {' '.join(KNOWN_MODELS)}. Use 'all' for {KNOWN_MODELS}.")
+    p.add_argument("--start-year", type=int, default=START_YEAR, help=f"First year (default {START_YEAR}).")
+    p.add_argument("--end-year", type=int, default=END_YEAR, help=f"Last year, inclusive (default {END_YEAR}).")
+    p.add_argument("--output-root", default=".",
+                   help="Directory under which outputs_wnet_standard_<MODEL>/ is created (default: cwd).")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    models = KNOWN_MODELS if len(args.models) == 1 and args.models[0].lower() == "all" else args.models
+    for model in models:
+        try:
+            process_model(model, args.start_year, args.end_year, args.output_root)
+        except Exception as e:
+            print(f"  ERROR processing model {model}: {e}")
+
 
 if __name__ == "__main__":
     main()

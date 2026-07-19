@@ -6,6 +6,15 @@ Run this once per month to cache all preprocessing:
     python preprocess_cache.py --year 1980 --month 1
 Or for a range:
     python preprocess_cache.py --year 1980 --start-month 1 --end-month 12
+
+⚠ ERA5-ERA ONLY — NOT WIRED FOR THE RegCM PRECIPITATION-BASED MCS BRANCH.
+It does not load pr/prc, so preprocess_data_improved() receives PR_ds=None and
+every MCS mask (channels 11/12/13) comes out EMPTY — silently, because a model
+trained on that simply learns "MCS never happens". The RegCM path does not use
+this script: its CACHE_DIR is deliberately kept empty to force cache_loader's
+NetCDF fallback, which does load precipitation. Use precompute_tensors.py.
+To revive this for RegCM, add a PR_ds loader mirroring the BT block below and
+pass PR_ds= to preprocess_data_improved.
 """
 
 import os

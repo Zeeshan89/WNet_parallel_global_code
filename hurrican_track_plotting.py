@@ -245,7 +245,7 @@ def plot_hurricane_tracks(tracks, year, output_dir):
 
 def render_hurricane_figure(tracks, year):
     """Build and return the matplotlib figure without saving."""
-    extent = [-180.0, 180.0, -45.0, 45.0]
+    extent = [-130.0, -30.0, 0, 45.0]
     colors = plt.cm.tab20.colors
 
     fig = plt.figure(figsize=(16, 12))
@@ -457,15 +457,43 @@ def process_all_years(base_path, output_dir):
 
 
 def main():
-    base_path  = "/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/Percentile_ARs_detection/ARs_Hurricanes_ETCs_MCS/MCS_enhanced_trial61/ETCs_enchanced_test_etc_21/Hurricanes_track_files_final_3"
-    output_dir = "/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/Percentile_ARs_detection/ARs_Hurricanes_ETCs_MCS/MCS_enhanced_trial61/ETCs_enchanced_test_etc_21/Hurricanes_track_files_final_3/Plotting_results"
+    """Plot the per-year hurricane tracks written by Hurricane_track.py.
+
+    Reads <base_path>/CONUS_year_<YYYY>/CONUS_hurricane_tracks_detailed_<YYYY>.txt
+    and writes PNGs + a combined PDF into <base_path>/Plotting_results/.
+    The .txt format is unchanged, so this is a paths-only update for RegCM.
+
+    Usage:
+        REGCM_MODEL=ACC python hurrican_track_plotting.py
+        python hurrican_track_plotting.py --model BCC
+        python hurrican_track_plotting.py --base-path /path/to/Hurricane_tracks
+    """
+    import argparse
+    KNOWN = ["ACC", "BCC", "CNR", "MPI", "MRI", "NOR"]
+    p = argparse.ArgumentParser(description="Plot RegCM hurricane tracks (.txt -> PNG/PDF)")
+    p.add_argument("--model", default=os.environ.get("REGCM_MODEL", "ACC"),
+                   help=f"RegCM model ({'/'.join(KNOWN)}). Default $REGCM_MODEL or ACC.")
+    p.add_argument("--base-path", default=None,
+                   help="Tracks dir with CONUS_year_* folders "
+                        "(default: ARs_Hurricanes_ETCs_MCS/Outputs_RegCM_PR_<MODEL>/Hurricane_tracks)")
+    p.add_argument("--output-dir", default=None,
+                   help="Where to write figures (default: <base-path>/Plotting_results)")
+    args = p.parse_args()
+
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    # Matches Hurricane_track.py's output_dir (<detection dir>/Hurricane_tracks).
+    base_path = args.base_path or os.path.join(
+        HERE, "ARs_Hurricanes_ETCs_MCS", f"Outputs_RegCM_PR_{args.model}", "Hurricane_tracks")
+    output_dir = args.output_dir or os.path.join(base_path, "Plotting_results")
 
     if not os.path.exists(base_path):
         print(f"Error: Base path does not exist: {base_path}")
+        print(f"  (run Hurricane_track.py --model {args.model} first)")
         return
 
     print("Hurricane Track Spatial Plotting Script (no filtering)")
     print("="*50)
+    print(f"Model:            {args.model}")
     print(f"Base path:        {base_path}")
     print(f"Output directory: {output_dir}")
     print("="*50)

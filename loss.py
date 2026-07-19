@@ -950,10 +950,24 @@ class ARSegmentationLoss(nn.Module):
         return etc_loss
 
     @autocast(enabled=False)
-    def compute_mcs_losses(self, mcs_probs, target_mcs, mcs_boundary_mask, 
+    def compute_mcs_losses(self, mcs_probs, target_mcs, mcs_boundary_mask,
                         mcs_core_pixels_mask, mcs_blobs_mask):
         """
         Compute MCS-specific losses - SIMPLIFIED using pre-processed blob masks
+
+        ⚠ PARAMETER NAMES ARE MISLEADING — the caller passes positionally
+        (mcs_probs, target_mcs, ch11, ch12, ch13), so:
+            mcs_boundary_mask    <- ch11 (mcs_boundary)   ✓ as named
+            mcs_core_pixels_mask <- ch12 (mcs_blobs)      ✗ and never used below
+            mcs_blobs_mask       <- ch13 (mcs_core)       ✗ despite the name
+        i.e. ch12 is dead in the loss and only ch11/ch13 affect training.
+
+        This is currently INERT: the precip branch sets ch13 == ch12, so the loss
+        receives the blob mask under either binding. It was left unfixed on purpose
+        — correcting it would change the trained objective at the same time as the
+        input field and confound attribution. If a gate is ever reintroduced that
+        makes ch13 != ch12 (e.g. mcs_source="bt", where ch13 = blobs * IWV gate),
+        this becomes live again and must be fixed first.
         """
         mcs_logits = torch.logit(mcs_probs.clamp(1e-7, 1-1e-7))
         
@@ -996,98 +1010,84 @@ class ARSegmentationLoss(nn.Module):
 
     def forward(self, seg_probs, inputs, target=None, batch_idx=0):
         """
-        Forward pass with memory optimization and autocast compatibility
-        Now handles 5 classes: background, AR, Hurricane, ETC, MCS
-        Returns dictionary with individual and total losses for tracking
+        Forward pass with memory optimization and autocast compatibility.
+        RegCM: 5 classes — background, AR, Hurricane, ETC, MCS (BT available).
+        Returns dictionary with individual and total losses for tracking.
         """
 
-        # Extract probability channels (now expecting 4 channels)
-        ar_probs = seg_probs[:, 1]  # AR class T
-        hurricane_probs = seg_probs[:, 2]  # Hurricane class T
-        etc_probs = seg_probs[:, 3]  # ETC class (new) T
-        mcs_probs = seg_probs[:, 4]  # MCS class (new) T
-        
+        # Extract probability channels (5-class seg output: bg/AR/Hurr/ETC/MCS)
+        ar_probs = seg_probs[:, 1]  # AR class
+        hurricane_probs = seg_probs[:, 2]  # Hurricane class
+        etc_probs = seg_probs[:, 3]  # ETC class
+        mcs_probs = seg_probs[:, 4]  # MCS class
+
         # Extract input channels
-        ivt_channel = inputs[:, 0]  # IVT T
-        ivt_binary = inputs[:, 1]  # Binary IVT mask (AR detection) T
-        
+        ivt_channel = inputs[:, 0]  # IVT
+        ivt_binary = inputs[:, 1]  # Binary IVT mask (AR detection)
+
         # Extract hurricane detection channels
         pressure_mask = inputs[:, 2]  # Low pressure mask
-        vorticity_mask = inputs[:, 3]  # High vorticity mask  
+        vorticity_mask = inputs[:, 3]  # High vorticity mask
         wind_speed_mask = inputs[:, 4]  # High wind speed mask
         strict_hurricane_eye_mask = inputs[:, 5]  # STRICT hurricane eye mask
         wind_speed_binary = inputs[:, 6]  # Wind speed binary mask
-        
-        # Extract ETC detection channels (new)
+
+        # Extract ETC detection channels
         etc_pressure_mask = inputs[:, 7]  # ETC low pressure mask
-        # etc_cold_core_mask = inputs[:, 13]  # ETC cold core mask
         etc_vorticity_mask = inputs[:, 8]  # ETC vorticity mask
         etc_wind_mask = inputs[:, 9]  # ETC wind speed mask
         etc_adaptive_mask = inputs[:, 10]  # ETC strict detection mask
-        
-        
-        # Extract MCS detection channels (new)
-        # # Note: Based on your channel layout from the dataloader
-        # mcs_convection_mask = inputs[:, 11]  # MCS deep convection mask
-        # mcs_precip_mask = inputs[:, 12]  # MCS heavy precipitation mask
-        # # mcs_wind_mask = inputs[:, 21]  # MCS wind speed mask
-        # mcs_core_mask = inputs[:, 13]  # MCS core detection mask
 
+        # Extract MCS detection channels (two-threshold approach)
+        mcs_convection_mask = inputs[:, 11]  # MCS boundary (241 K) mask
+        mcs_precip_mask = inputs[:, 12]  # MCS blobs mask
+        mcs_core_mask = inputs[:, 13]  # MCS core (225 K) mask
 
-        # Extract MCS detection channels (updated for two-threshold approach)
-        mcs_convection_mask = inputs[:, 11]  # MCS deep convection mask
-        mcs_precip_mask = inputs[:, 12]  # MCS heavy precipitation mask
-        mcs_core_mask = inputs[:, 13]  # MCS core detection mask
-    
         # Generate targets
         if target is None:
             target_ar = ivt_binary
             target_hurricane = strict_hurricane_eye_mask
-            target_etc = etc_adaptive_mask  # New ETC target
-            target_mcs = mcs_core_mask  # New MCS target
+            target_etc = etc_adaptive_mask
+            target_mcs = mcs_core_mask
         else:
             target_ar = target[:, 1]
             target_hurricane = target[:, 2]
-            target_etc = target[:, 3]  # New ETC target
-            target_mcs = target[:, 4]  # New MCS target
-        
+            target_etc = target[:, 3]
+            target_mcs = target[:, 4]
+
         # Compute AR losses
         ar_loss = self.compute_ar_losses(ar_probs, target_ar, ivt_channel, ivt_binary)
-        
+
         # Compute hurricane losses
         hurricane_loss = self.compute_hurricane_losses(
-            hurricane_probs, target_hurricane, wind_speed_mask, vorticity_mask, 
+            hurricane_probs, target_hurricane, wind_speed_mask, vorticity_mask,
             pressure_mask, strict_hurricane_eye_mask, wind_speed_binary
         )
-        
-        # Compute ETC losses (new)
+
+        # Compute ETC losses
         etc_loss = self.compute_etc_losses(
             etc_probs, target_etc, etc_pressure_mask,
             etc_vorticity_mask, etc_wind_mask, etc_adaptive_mask
         )
-        
-        # Compute MCS losses (updated for two-threshold approach)
+
+        # Compute MCS losses (two-threshold approach)
         mcs_loss = self.compute_mcs_losses(
             mcs_probs, target_mcs, mcs_convection_mask, mcs_precip_mask, mcs_core_mask)
-        
-        # # Compute MCS losses (new)
-        # mcs_loss = self.compute_mcs_losses(
-        #     mcs_probs, target_mcs, mcs_convection_mask, mcs_precip_mask, mcs_core_mask)
-        
-        # Prevent overlaps between storm types (expanded for MCS)
+
+        # Prevent overlaps between storm types
         ar_hurricane_overlap = (ar_probs * hurricane_probs).mean()
         ar_etc_overlap = (ar_probs * etc_probs).mean()
-        ar_mcs_overlap = (ar_probs * mcs_probs).mean()  # New
+        ar_mcs_overlap = (ar_probs * mcs_probs).mean()
         hurricane_etc_overlap = (hurricane_probs * etc_probs).mean()
-        hurricane_mcs_overlap = (hurricane_probs * mcs_probs).mean()  # New
-        etc_mcs_overlap = (etc_probs * mcs_probs).mean()  # New
-        
-        total_overlap_loss = (ar_hurricane_overlap + ar_etc_overlap + ar_mcs_overlap + 
+        hurricane_mcs_overlap = (hurricane_probs * mcs_probs).mean()
+        etc_mcs_overlap = (etc_probs * mcs_probs).mean()
+
+        total_overlap_loss = (ar_hurricane_overlap + ar_etc_overlap + ar_mcs_overlap +
                             hurricane_etc_overlap + hurricane_mcs_overlap + etc_mcs_overlap)
-        
-        # Total loss (now includes MCS)
+
+        # Total loss (includes MCS)
         total_loss = ar_loss + hurricane_loss + etc_loss + mcs_loss + total_overlap_loss
-        
+
         # Return dictionary with individual losses for tracking
         return {
             'total_loss': total_loss,

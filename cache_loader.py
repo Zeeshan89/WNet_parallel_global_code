@@ -119,9 +119,14 @@ class CacheAwareDataLoader:
         if fallback_to_netcdf:
             print(f"  Preprocessing from NetCDF (slower)...")
             from main import calculate_ivt, preprocess_data_improved, find_matching_vorticity
+            from utils import open_wnet_dataset
             
             date_str = f"{year:04d}{month:02d}"
-            nc_filename = f"era5dara_{date_str}.nc"
+            # RegCM regridded inputs are named "<MODEL>dara_YYYYMM.nc" (mimicking
+            # the ERA5 "era5dara_" template). The model is selected via the
+            # REGCM_MODEL env var so one code copy serves all six runs.
+            model = os.environ.get("REGCM_MODEL", "ACC")
+            nc_filename = f"{model}dara_{date_str}.nc"
             file_path = os.path.join(data_dir, nc_filename)
             
             if not os.path.exists(file_path):
@@ -134,7 +139,7 @@ class CacheAwareDataLoader:
                     print("Error: 'xarray' not available in Python environment — cannot preprocess NetCDF fallback.")
                     return None
                     
-                ERA5_6hrly_ARs = xr.open_dataset(file_path)
+                ERA5_6hrly_ARs = open_wnet_dataset(file_path)   # normalises noleap→datetime64
                 ERA5_6hrly_ARs = calculate_ivt(ERA5_6hrly_ARs)
                 ERA5_6hrly_ARs = ERA5_6hrly_ARs.assign_coords(
                     longitude=(((ERA5_6hrly_ARs.longitude + 180) % 360) - 180)
@@ -201,12 +206,25 @@ class CacheAwareDataLoader:
                 # tpr_data = tpr_data if tpr_data is not None else tpr_da
                 iwv_data = iwv_data if iwv_data is not None else iwv_da
                 
-                # Other optional data
+                # ── RegCM: vorticity & wind_speed live INLINE in the regridded
+                # main file (renamed vo850→vorticity, wspd850→wind_speed by the
+                # CDO step), so read them straight from the file and ignore any
+                # ERA5-aux-dir kwargs. Same grid/time as IVT → no .sel needed.
+                if 'vorticity' in ERA5_6hrly_ARs:
+                    vorticity_data = ERA5_6hrly_ARs['vorticity']
+                if 'wind_speed' in ERA5_6hrly_ARs:
+                    wind_speed_data = ERA5_6hrly_ARs['wind_speed']
+
+                # Other optional data (absent in RegCM → None → dataset zero-fills;
+                # temp_500mb feeds only the disabled warm-core branch).
+                # PR_ds (pr/prc, mm/h) drives the MCS branch and is NOT optional —
+                # the caller gates on it before reaching here.
                 temp_500mb_data = preprocess_kwargs.get('temp_500mb')
                 bt_data = preprocess_kwargs.get('BT_ds')
+                pr_data = preprocess_kwargs.get('PR_ds')
                 windhshear_data = preprocess_kwargs.get('windhshear_ds')
                 ivt_percentile_data = preprocess_kwargs.get('ivt_percentile', 400)
-                
+
                 # Call preprocessing with available data
                 preprocessed = preprocess_data_improved(
                     ivt=ivt_da,
@@ -216,7 +234,7 @@ class CacheAwareDataLoader:
                     ivt_percentile=ivt_percentile_data,
                     temp_500mb=temp_500mb_data,
                     BT_ds=bt_data,
-                    # TPR=tpr_data,
+                    PR_ds=pr_data,
                     IWV=iwv_data,
                     windhshear_ds=windhshear_data
                 )

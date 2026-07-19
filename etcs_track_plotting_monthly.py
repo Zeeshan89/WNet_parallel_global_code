@@ -1,3 +1,6 @@
+
+## REGCM_MODEL=ACC python etcs_track_plotting_monthly.py
+
 import os
 import re
 import pandas as pd
@@ -15,10 +18,10 @@ class ETCTrackPlotter:
     A class for plotting Extra-Tropical Cyclone (ETC) tracks from monthly data files.
     """
     
-    def __init__(self, base_path, output_dir, min_track_length=5):
+    def __init__(self, base_path, output_dir, min_track_length=5, model=None):
         """
         Initialize the ETC Track Plotter.
-        
+
         Parameters:
         -----------
         base_path : str
@@ -27,10 +30,15 @@ class ETCTrackPlotter:
             Directory where plots will be saved
         min_track_length : int
             Minimum number of points required for a valid track
+        model : str or None
+            RegCM model name (ACC/BCC/...). Used to resolve the current
+            ETC_tracks_<MODEL>_<YYYY>.txt naming; None falls back to the
+            older ERA5-era filenames.
         """
         self.base_path = base_path
         self.output_dir = output_dir
         self.min_track_length = min_track_length
+        self.model = model
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
@@ -214,11 +222,16 @@ class ETCTrackPlotter:
         --------
         list : List of tracks for the year
         """
+        # RegCM tracker writes ETC_tracks_<MODEL>_<YYYY>.txt; the older ERA5
+        # names are kept so previously generated files still load.
         possible_patterns = [
+            f"ETC_tracks_{self.model}_{year}.txt" if self.model else None,
+            f"ETC_tracks_{year}_meteorological_v2.txt",
             f"ETC_tracks_{year}_meteorological.txt",
-            f"ETC_tracks_{year}.txt"
+            f"ETC_tracks_{year}.txt",
         ]
-        
+        possible_patterns = [p for p in possible_patterns if p]
+
         for pattern in possible_patterns:
             file_path = os.path.join(self.base_path, pattern)
             if os.path.exists(file_path):
@@ -232,9 +245,11 @@ class ETCTrackPlotter:
                     print(f"  Error loading {year}: {e}")
                     return []
         
-        # Try to find with glob pattern
-        pattern = os.path.join(self.base_path, f"*{year}*ETC*.txt")
-        matching_files = glob.glob(pattern)
+        # Glob fallback. NOTE the old pattern was "*{year}*ETC*.txt", which
+        # required the year BEFORE "ETC" and so could never match the current
+        # naming (ETC_tracks_<MODEL>_<YYYY>.txt). Match on the year anywhere.
+        matching_files = sorted(glob.glob(os.path.join(self.base_path, f"*ETC*{year}*.txt"))
+                                or glob.glob(os.path.join(self.base_path, f"*{year}*ETC*.txt")))
         if matching_files:
             file_path = matching_files[0]
             print(f"Loading year {year}: {os.path.basename(file_path)}")
@@ -499,31 +514,54 @@ def main():
     """
     Main function to run the ETC track plotting for multiple years.
     """
-    # Set paths
-    base_path = "/lustre/orion/cli138/proj-shared/z7a/Storms_data/Storms_precipitation_notebooks/Percentile_ARs_detection/ARs_Hurricanes_ETCs_MCS/MCS_enhanced_trial58/ETCs_enchanced_test_etc/ETC_track_files_yearly_5/"
-    output_dir = "/lustre/orion/cli138/proj-shared/z7a/Storms_data/Storms_precipitation_notebooks/Percentile_ARs_detection/ARs_Hurricanes_ETCs_MCS/MCS_enhanced_trial58/ETCs_enchanced_test_etc/ETC_track_files_yearly_5/yearly_plots"
-    
-    # Year range configuration
-    start_year = 1980
-    end_year = 1990
-    
-    # Track filtering configuration
-    min_track_length = 8
-    
+    # Reads the per-year tracks written by updated_monthly_ETC_Tracker.py:
+    #   Outputs_RegCM_PR_<MODEL>/ETC_tracks/ETC_tracks_<MODEL>_<YYYY>.txt
+    #
+    # Usage:
+    #   REGCM_MODEL=ACC python etcs_track_plotting_monthly.py
+    #   python etcs_track_plotting_monthly.py --model BCC --start-year 2005 --end-year 2014
+    import argparse
+    KNOWN = ["ACC", "BCC", "CNR", "MPI", "MRI", "NOR"]
+    p = argparse.ArgumentParser(description="Plot RegCM ETC tracks (.txt -> PNG)")
+    p.add_argument("--model", default=os.environ.get("REGCM_MODEL", "ACC"),
+                   help=f"RegCM model ({'/'.join(KNOWN)}). Default $REGCM_MODEL or ACC.")
+    p.add_argument("--start-year", type=int, default=1980)
+    p.add_argument("--end-year", type=int, default=2014)
+    p.add_argument("--base-path", default=None,
+                   help="Dir with ETC_tracks_<MODEL>_<YYYY>.txt "
+                        "(default: ARs_Hurricanes_ETCs_MCS/Outputs_RegCM_PR_<MODEL>/ETC_tracks)")
+    p.add_argument("--output-dir", default=None,
+                   help="Where to write figures (default: <base-path>/yearly_plots)")
+    p.add_argument("--min-track-length", type=int, default=8)
+    args = p.parse_args()
+
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    base_path = args.base_path or os.path.join(
+        HERE, "ARs_Hurricanes_ETCs_MCS", f"Outputs_RegCM_PR_{args.model}", "ETC_tracks")
+    output_dir = args.output_dir or os.path.join(base_path, "yearly_plots")
+
+    start_year = args.start_year
+    end_year = args.end_year
+    min_track_length = args.min_track_length
+
     # Check if base path exists
     if not os.path.exists(base_path):
         print(f"Error: Base path does not exist: {base_path}")
+        print(f"  (run updated_monthly_ETC_Tracker.py --model {args.model} first)")
         return
-    
+
     print(f"ETC Track Annual Plotting Configuration:")
+    print(f"- Model: {args.model}")
     print(f"- Base path: {base_path}")
     print(f"- Output directory: {output_dir}")
     print(f"- Year range: {start_year} to {end_year}")
     print(f"- Minimum track length: {min_track_length} points")
     print("- Plot bounds: Auto-calculate from data")
-    
+
     # Create ETC plotter instance
-    etc_plotter = ETCTrackPlotter(base_path, output_dir, min_track_length=min_track_length)
+    etc_plotter = ETCTrackPlotter(base_path, output_dir,
+                                  min_track_length=min_track_length,
+                                  model=args.model)
     
     # Process all years in range
     successful_years = 0

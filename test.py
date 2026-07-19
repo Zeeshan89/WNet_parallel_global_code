@@ -41,7 +41,16 @@ from skimage.measure import regionprops
 from WNet_model import ImprovedWNet
 from dataset import ARDatasetImproved, preprocess_data_improved
 from post_processing import enhanced_post_process_ar_segmentation, track_mcs_timeseries
-from utils import setup_gpu, calculate_ivt, find_matching_vorticity, load_percentile_dataset
+from utils import (setup_gpu, calculate_ivt, find_matching_vorticity,
+                   load_percentile_dataset, load_regcm_global_stats,
+                   load_regcm_bt_thresholds, load_regcm_pr_thresholds,
+                   open_wnet_dataset)
+
+# ── RegCM-CMIP6 selection (drives all input paths + the per-model stats) ────────
+# Same convention as main.py / precompute_tensors.py: pick via `export REGCM_MODEL=ACC`.
+REGCM_MODEL = os.environ.get("REGCM_MODEL", "ACC")
+REGCM_BASE  = "/lustre/orion/cli138/proj-shared/dr6/eventtype/Data/RegCM-CMIP6/Data-processed"
+REGCM_GS    = f"{REGCM_BASE}/{REGCM_MODEL}/global_stats"
 from scipy.ndimage import binary_opening, binary_closing
 import numpy as np
 import torch
@@ -579,12 +588,22 @@ def evaluate_and_save_results(model, dataset, era5_dataset, vorticity_data, wind
             
             print(f"Final results - AR pixels: {np.sum(post_processed_ar_map_final)}, ETCs pixels: {np.sum(post_processed_etc_map_final)}, Hurricane pixels: {np.sum(post_processed_hurricane_map_final)}, MCS pixels: {np.sum(post_processed_mcs_map_final)}")
     
-    # MCS: RAW model blobs + overlap tracking → storm-ID field (MCS_id), so the
-    # benchmark metric can compute true ID-based storm-hours for WNet.
-    # OVERLAP-ONLY: no minimum-area criterion, no minimum-lifetime pruning.
+    # MCS: full Feng-style criteria + overlap tracking → storm-ID field (MCS_id),
+    # so the benchmark metric can compute true ID-based storm-hours for WNet.
+    # Minimum cloud-shield area 60,000 km², then overlap linking, then drop
+    # tracks living < 2 frames (≈6 h at 6-hourly cadence). The ordering matters
+    # (area filter before linking, so small blobs never seed tracks) and is
+    # handled inside track_mcs_timeseries — do not reorder.
+    # NOTE: apply_min_area.py must NOT be run on this output. It applies the 60k
+    # area filter post-hoc but never applies the lifetime criterion, so running
+    # both would imply a comparability that does not hold.
+    # min_net_displacement_km removes quasi-stationary, terrain-anchored systems
+    # (the winter Cascades artifact) while retaining ~76-84% of the genuine
+    # continental signal — see post_processing.track_mcs_timeseries step 4.
     mcs_results, mcs_id_results = track_mcs_timeseries(
         mcs_results, lats, lons,
-        min_area_km2=None, link_overlap=0.5, min_lifetime_steps=1,
+        min_area_km2=60000.0, link_overlap=0.5, min_lifetime_steps=2,
+        min_net_displacement_km=float(os.environ.get("MCS_MIN_DISP_KM", 400.0)),
     )
 
     # Save results to NetCDF files
@@ -1040,14 +1059,12 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
     # Load the 90th percentile IVT threshold data
     print("Loading 90th percentile IVT threshold data...")
     # IVT_90th_percentile_path = '/lustre/orion/cli138/proj-shared/z7a/Storms_data/Storms_precipitation_notebooks/ivt_only/IVT_90th_percentile_cdo.nc'
-    vor850_results_per_path = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/vor850_latlongrid/vor850_latlongrid/output/vor850_75th_percentile_global.nc'
-    # vor500_results_per_path = '/lustre/orion/proj-shared/cli138/dr6/eventtype/Data/ERA5/GLOBAL/vor/nc_files/vor500_latlongrid/output/vor500_75th_percentile_global.nc'
-    windspeed_results_per_path = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/wind_speed_850/output/windspeed850_75th_percentile_global.nc'
-    # Tpr_results_per_path = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/data/tpr_percentiles/tpr_nonzero_85th_percentile_global.nc'
-    # BT10_results_per_path = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/OLR/brightness_temp_new/output/bt_10th_percentile_global.nc'
-    mslp_anomaly_glob = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/data/global_stats/mslp_monthly_climatology.nc'
-    # IWV monthly climatology (12, lat, lon) for the MCS moisture-anomaly gate (Option 1).
-    iwv_climatology_glob = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/data/global_stats/iwv_monthly_climatology.nc'
+    # RegCM per-model percentile / climatology fields (from the CDO Steps 1–3).
+    vor850_results_per_path    = f'{REGCM_GS}/{REGCM_MODEL}_vor850_75th.nc'
+    windspeed_results_per_path = f'{REGCM_GS}/{REGCM_MODEL}_windspeed850_75th.nc'
+    mslp_anomaly_glob          = f'{REGCM_GS}/{REGCM_MODEL}_mslp_monthly_climatology.nc'
+    # IWV monthly climatology (12, lat, lon) for the MCS moisture-anomaly gate.
+    iwv_climatology_glob       = f'{REGCM_GS}/{REGCM_MODEL}_iwv_monthly_climatology.nc'
 
 
     # percentile_threshold   = load_percentile_dataset(IVT_90th_percentile_path)
@@ -1062,46 +1079,34 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
                             if os.path.exists(iwv_climatology_glob) else None)
     if iwv_clim_result_glob is None:
         print(f"⚠ IWV climatology not found at {iwv_climatology_glob} — MCS uses absolute-IWV gate")
+
+    # Per-model normalization stats + MCS BT shield/core thresholds.
+    _REGCM_STATS = load_regcm_global_stats(REGCM_MODEL, REGCM_GS)
+    _REGCM_BT    = load_regcm_bt_thresholds(REGCM_MODEL, REGCM_GS)   # legacy BT A/B path
+    _REGCM_PR    = load_regcm_pr_thresholds(REGCM_MODEL, REGCM_GS)   # MCS precip thresholds
     
     # Load SST data directory # era5_sst_1980.nc
     # SST_dir = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/sst/celsius/'
     # SST_files = sorted(glob.glob(os.path.join(SST_dir, 'era5_sst_*_6hourly_celsius.nc')))
-    Bright_temp = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/OLR/brightness_temp_new/' 
-    
-    
-    # Load vorticity data for hurricane detection
-    print("Loading vorticity data for hurricane detection...")
-    vorticity_dir = '/lustre/orion/cli138/proj-shared/z7a/Storms_data/vor850_latlongrid/vor850_latlongrid/'
-    vorticity_files = sorted(glob.glob(os.path.join(vorticity_dir, 'ERA5_vor_6hourly_*.850mb_latlon.nc')))
+    # RegCM: BT lives in the per-model yearly latlon files; vorticity & wind_speed
+    # are INLINE in each regridded monthly file (read below); temp_500mb / windshear
+    # do not exist in RegCM output.
+    Bright_temp = f'{REGCM_BASE}/{REGCM_MODEL}/BT_6hourly_latlon'
+    # Precipitation (pr, prc in mm/h) — MCS source; built by Run_PR_regrid.sh
+    Precip_dir  = f'{REGCM_BASE}/{REGCM_MODEL}/PR_6hourly_latlon'
+
+    vorticity_files = []   # RegCM vorticity is inline, not a separate ERA5 aux dir
     
     ## vorticity 500mb
     # vorticity_500_dir = '/lustre/orion/proj-shared/cli138/dr6/eventtype/Data/ERA5/GLOBAL/vor/nc_files/vor500_latlongrid/'
     # vorticity_500_files = sorted(glob.glob(os.path.join(vorticity_500_dir, 'ERA5_vor_6hourly_*.500mb_latlon.nc')))
     
     
-    # Load wind speed data ONCE outside the file loop
-    print("Loading wind speed data...")
-    wind_speed_path = '/lustre/orion/cli138/proj-shared/z7a/Storms_data/wind_speed_850/ERA5_windspeed_850mb_6hourly_final.nc'
-    
-    if os.path.exists(wind_speed_path):
-        wind_speed_full = xr.open_dataset(wind_speed_path).squeeze('level')
-        wind_speed_full = wind_speed_full.assign_coords(
-            longitude=(((wind_speed_full.longitude + 180) % 360) - 180)
-        ).sortby('longitude')
-        print(f"Wind speed data loaded successfully. Shape: {wind_speed_full['wspd'].shape}")
-    else:
-        print(f"Warning: Could not find wind speed file at {wind_speed_path}")
-        print("Wind speed data will be disabled.")
-        wind_speed_full = None
-    
-    # Load 500mb temperature data directory (t300-t500)
-    # temp_500mb_dir = '/lustre/orion/proj-shared/cli138/dr6/eventtype/Data/ERA5/GLOBAL/from-ncar-server/t/Hurricane_warmcore/monthly_output_6hourly'
-    temp_500mb_dir = '/lustre/orion/proj-shared/cli138/dr6/eventtype/Data/ERA5/GLOBAL/from-ncar-server/t/monthly_output/6_hourly'
-    
-
-    # Load windshear data directory # 6hourly_ERA5_windshear_198001.nc
-    # Calculate magnitude: shear_mag = sqrt(u_shear^2 + v_shear^2) in windshear_dir
-    windshear_dir = '/lustre/orion/cli138/proj-shared/z7a/Storms_data/wind_shear_mag_sqrtu_v/'
+    # RegCM: wind_speed is inline in each monthly file (read inside the loop).
+    wind_speed_full = None
+    # temp_500mb / windshear are absent in RegCM output.
+    temp_500mb_dir = None
+    windshear_dir  = None
     
     ibtracs_file = (
         "/lustre/orion/proj-shared/cli138/dr6/eventtype/run-tracking/"
@@ -1133,14 +1138,17 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
 
     # Get all ERA5 files in the specified year range
     if os.path.isdir(data_dir):
-        all_nc_files = [f for f in os.listdir(data_dir) if f.startswith('era5dara_') and f.endswith('.nc')]
-        
-        # Filter by year range
+        all_nc_files = [f for f in os.listdir(data_dir)
+                        if f.startswith(f'{REGCM_MODEL}dara_') and f.endswith('.nc')]
+
+        # Filter by year range. Parse YYYYMM robustly from "<MODEL>dara_YYYYMM.nc"
+        # (the prefix length varies by model, so split on '_' instead of fixed offsets).
         nc_files = []
         for f in all_nc_files:
             try:
-                file_year = int(f[9:13])  # Extract year from filename
-                file_month = int(f[13:15])  # e.g. "04"
+                date_str = f.split('_')[1].split('.')[0]   # "198001"
+                file_year  = int(date_str[:4])
+                file_month = int(date_str[4:6])
                 if start_year <= file_year <= end_year and start_month <= file_month <= end_month:
                     nc_files.append(f)
             except (ValueError, IndexError):
@@ -1195,7 +1203,7 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
         try:
             # Load the dataset
             file_path = os.path.join(data_dir, nc_file)
-            ERA5_6hrly_ARs = xr.open_dataset(file_path)
+            ERA5_6hrly_ARs = open_wnet_dataset(file_path)   # normalises noleap→datetime64
             ERA5_6hrly_ARs = calculate_ivt(ERA5_6hrly_ARs)
             # Convert longitude from 0-360 to -180 to 180 and sort
             ERA5_6hrly_ARs = ERA5_6hrly_ARs.assign_coords(
@@ -1229,122 +1237,48 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
             #     print("No matching SST file found for this year.")
             #     SST_ds = None
             
-            ### BT data loading/reading
-            BT_file = os.path.join(Bright_temp, f'era5_bt_6hourly_{year_part}.nc')
-            # print("sst_file",sst_file)
-            if BT_file is not None:
-                BT_ds = xr.open_dataset(BT_file).rename({'valid_time':'time'})
-                BT_ds = BT_ds.assign_coords(
-                    longitude=(((BT_ds.longitude + 180) % 360) - 180)
-                ).sortby('longitude')
-                
+            ### BT data loading/reading (RegCM yearly file: <MODEL>_bt_6hourly_YYYY.nc,
+            ### var 'bt', time dim 'time'; clear-sky NaN is filled in preprocess).
+            BT_file = os.path.join(Bright_temp, f'{REGCM_MODEL}_bt_6hourly_{year_part}.nc')
+            if os.path.exists(BT_file):
+                BT_ds = xr.open_dataset(BT_file)
+                if 'valid_time' in BT_ds.dims:          # RegCM uses 'time'; guard both
+                    BT_ds = BT_ds.rename({'valid_time': 'time'})
                 BT_ds = BT_ds['bt']
-                # BT_ds = BT_ds.sel(time=ERA5_6hrly_ARs['time'])
                 common_times = np.intersect1d(BT_ds.time.values, ERA5_6hrly_ARs.time.values)
                 BT_ds = BT_ds.sel(time=common_times)
-
             else:
-                print("No matching BT file found for this year.")
+                print(f"No matching BT file found: {BT_file}")
                 BT_ds = None
-            
-            # temp_500mb_file = os.path.join(temp_500mb_dir, f'ERA5_warmcore_{date_part}_6hourly.nc')
-            windshear_file = os.path.join(windshear_dir, f'6hourly_ERA5_windshear_mag_{date_part}.nc') 
-            
-            # print("temp_500mb_file",temp_500mb_file)
-            
-            # if os.path.exists(temp_500mb_file):
-            #     temp_500mb_ds = xr.open_dataset(temp_500mb_file).sel(level='300')
-            #     temp_500mb_ds = temp_500mb_ds.assign_coords(longitude=(((temp_500mb_ds.longitude + 180) % 360) - 180)
-            #     ).sortby('longitude')
-                
-            #     # Get the temperature variable (assuming it's 't' or similar)
-            #     temp_500mb_interp = temp_500mb_ds["T"]
-            #     common_times = np.intersect1d(temp_500mb_interp.time.values, ERA5_6hrly_ARs.time.values)
-            #     temp_500mb = temp_500mb_interp.sel(time=common_times)
 
-            #     # temp_500mb = temp_500mb_interp.sel(time=ERA5_6hrly_ARs['time'])
-                
-            #     print(f"Successfully loaded T300-500mb temperature data: {temp_500mb.shape}")
-            # else:
-            #     print(f"Temperature T300-500mb file not found: {temp_500mb_file}. Using default values.")
-            #     temp_500mb = None
-
-            temp_500mb_file = os.path.join(temp_500mb_dir, f'ERA5_t_500mb_{date_part}.nc')
-            
-            if os.path.exists(temp_500mb_file):
-                temp_500mb_ds = xr.open_dataset(temp_500mb_file).sel(level='500')
-                temp_500mb_ds = temp_500mb_ds.assign_coords(
-                    longitude=(((temp_500mb_ds.longitude + 180) % 360) - 180)
-                ).sortby('longitude')
-                
-                # Get the temperature variable (assuming it's 'T' or similar)
-                temp_500mb_interp = temp_500mb_ds["T"]
-                # temp_500mb = temp_500mb_interp.sel(time=ERA5_6hrly_ARs['time'])
-                common_times = np.intersect1d(temp_500mb_interp.time.values, ERA5_6hrly_ARs.time.values)
-                temp_500mb = temp_500mb_interp.sel(time=common_times)
-                
-                print(f"Successfully loaded 500mb temperature data: {temp_500mb.shape}")
+            ### Precipitation (pr, prc in mm/h) — the MCS source. Yearly file
+            ### <MODEL>_pr_6hourly_YYYY.nc from Run_PR_regrid.sh. open_wnet_dataset
+            ### normalises the noleap calendar (BCC/NOR) so the time intersect works.
+            PR_file = os.path.join(Precip_dir, f'{REGCM_MODEL}_pr_6hourly_{year_part}.nc')
+            if os.path.exists(PR_file):
+                PR_ds = open_wnet_dataset(PR_file)
+                _pr_times = np.intersect1d(PR_ds.time.values, ERA5_6hrly_ARs.time.values)
+                PR_ds = PR_ds.sel(time=_pr_times)
+                if PR_ds.sizes.get('time', 0) == 0:
+                    print(f"⚠ PR file has no times in common with {nc_file} — "
+                          f"MCS would be empty; skipping this file.")
+                    continue
             else:
-                print(f"Temperature file not found: {temp_500mb_file}. Using default values.")
-                temp_500mb = None
+                # MCS is precipitation-based: without pr every MCS mask is empty,
+                # which would look like "this model has no MCS" rather than an error.
+                print(f"⚠ No matching PR file found: {PR_file} — "
+                      f"MCS would be empty; skipping this file.")
+                continue
 
+            # ── RegCM: temp_500mb & windshear do not exist → None (zero-filled).
+            temp_500mb    = None
+            windhshear_ds = None
 
-            ## windshear magnitude dataset
-            if os.path.exists(windshear_file):
-                windhshear_ds = xr.open_dataset(windshear_file).sel(level='200')
-                windhshear_ds = windhshear_ds.assign_coords(
-                    longitude=(((windhshear_ds.longitude + 180) % 360) - 180)
-                ).sortby('longitude')
-                
-                # Get the temperature variable (assuming it's 't' or similar)
-                windshear_ds_interp = windhshear_ds["windshear"]
-                common_times = np.intersect1d(windshear_ds_interp.time.values, ERA5_6hrly_ARs.time.values)
-                windhshear_ds = windshear_ds_interp.sel(time=common_times)
-
-                print(f"Successfully loaded windhshear_ds data: {windhshear_ds.shape}")
-            else:
-                print(f"windhshear file not found: {windshear_file}. Using default values.")
-                windhshear_ds = None
-
-            # Find and load vorticity data 850mb
-            vorticity_file = find_matching_vorticity(era5_dates[0], vorticity_files)
-            
-            if vorticity_file is not None:
-                vorticity_ds = xr.open_dataset(vorticity_file).squeeze('plev')
-                vorticity_ds = vorticity_ds.assign_coords(
-                    longitude=(((vorticity_ds.longitude + 180) % 360) - 180)
-                ).sortby('longitude')
-                
-                vorticity_interp = vorticity_ds['var138']
-                common_times = np.intersect1d(vorticity_interp.time.values, ERA5_6hrly_ARs.time.values)
-                vorticity = vorticity_interp.sel(time=common_times)
-
-            else:
-                print("No matching vorticity file found for this year.")
-                vorticity = None
-                
-            ## vorticity 500mb
-            # vorticity_500_file = find_matching_vorticity(era5_dates[0], vorticity_500_files)
-            # if vorticity_500_file is not None:
-            #     vorticity_500_ds = xr.open_dataset(vorticity_500_file).squeeze('plev')
-            #     vorticity_500_ds = vorticity_500_ds.assign_coords(
-            #         longitude=(((vorticity_500_ds.longitude + 180) % 360) - 180)
-            #     ).sortby('longitude')
-                
-            #     vorticity_500_interp = vorticity_500_ds['var138']
-            #     common_times = np.intersect1d(vorticity_500_interp.time.values, ERA5_6hrly_ARs.time.values)
-            #     vorticity_500_mb = vorticity_500_interp.sel(time=common_times)
-
-            # else:
-            #     print("No matching vorticity 500mb file found for this year. Skipping hurricane detection for this file.")
-            #     vorticity_500_mb = None
-            
-            # Process wind speed data
-            wind_speed_selected = None
-            if wind_speed_full is not None:
-                wind_speed_interp = wind_speed_full['wspd']
-                wind_speed_selected = wind_speed_interp.sel(time=era5_dates)
-                # wind_speed_selected = wind_speed_selected.where(wind_speed_selected >= 12, 12)
+            # ── RegCM: vorticity & wind_speed are INLINE in the regridded file
+            #    (renamed vo850→vorticity, wspd850→wind_speed by the CDO step). Same
+            #    grid/time as IVT, so no separate load / time-select needed.
+            vorticity           = ERA5_6hrly_ARs['vorticity']  if 'vorticity'  in ERA5_6hrly_ARs else None
+            wind_speed_selected = ERA5_6hrly_ARs['wind_speed'] if 'wind_speed' in ERA5_6hrly_ARs else None
             
             # Interpolate percentile threshold to match dataset grid if needed
             interp_percentile = 400
@@ -1367,7 +1301,7 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
                 ivt_percentile=interp_percentile,
                 temp_500mb=temp_500mb,
                 BT_ds=BT_ds,
-                # TPR=TPR,
+                PR_ds=PR_ds,
                 IWV=IWV,
                 windhshear_ds=windhshear_ds
             )
@@ -1378,10 +1312,15 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
                 'vor850': vor850_results_per,       
                 'windspeed': windspeed_results_per, 
                  
-                ##MCS
-                'BT_boundary': 241.0,
-                'BT_core': 225.0,
-                
+                ##MCS — precipitation-based. BT_* below only feed the legacy
+                ## mcs_source="bt" A/B path.
+                'BT_boundary': _REGCM_BT["BT_boundary"],
+                'BT_core': _REGCM_BT["BT_core"],
+                'PR_shield': _REGCM_PR["PR_shield"],      # mm/h, convective
+                'PR_core': _REGCM_PR["PR_core"],          # mm/h, convective
+                'PR_convfrac': _REGCM_PR["PR_convfrac"],  # prc/pr, dimensionless
+
+
                 # UPDATED HURRICANE THRESHOLDS - Literature-based
                 "Temp500": 270.0,  # temp500_results_per, K
                 "vor850_per_hurr": 1.45e-5,            # CHANGED: Was 4.6e-05, now 1.5e-05 (Walsh et al. 2007)
@@ -1389,15 +1328,7 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
             }
 
 
-            global_stats = {
-                'IVT':  {'mean': 170.566,  'std': 11.6209},
-                'IWV':  {'mean': 24.1535,  'std': 1.12097},
-                'BT':   {'mean': 254.675,  'std': 0.648636},
-                'MSLP': {'mean': 101138.0, 'std': 15.6262},
-                'vorticity':  {'mean': -4.09177e-10, 'std': 4.02875e-05},  # ✓ fixed
-                'wind_speed': {'mean': 8.35723,   'std': 0.306227},
-                'temp_500mb': {'mean': 258.428,   'std': 0.832617},
-            }
+            global_stats = _REGCM_STATS   # per-model RegCM stats (loaded once, see main())
 
             # ── IBTrACS slice for this month  ◄─── ADD HERE, after time_values is built
             # time_values is now fully resolved from preprocessed_data above
@@ -1419,7 +1350,7 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
                 preprocessed_data, 
                 ivt_percentile=interp_percentile, 
                 vorticity_threshold=vorticity_threshold, 
-                target_size=(360, 720),  # Match training target_size
+                target_size=(192, 384),  # Match training target_size (RegCM/ERA5 = 192×384)
                 global_percentiles=global_percentiles,
                 global_stats=global_stats,          # ← ADD THIS
                 precompute=False,
@@ -1454,7 +1385,7 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
             })
             
             # Clean up
-            del ERA5_6hrly_ARs, ivt, mslp, vorticity, preprocessed_data, dataset,  interp_percentile, wind_speed_selected, BT_ds, IWV, windhshear_ds
+            del ERA5_6hrly_ARs, ivt, mslp, vorticity, preprocessed_data, dataset,  interp_percentile, wind_speed_selected, BT_ds, PR_ds, IWV, windhshear_ds
 
             gc.collect()
             if torch.cuda.is_available():
@@ -1499,21 +1430,29 @@ if __name__ == "__main__":
     )
     _parser.add_argument(
         "--data-dir",
-        default="/lustre/orion/cli138/proj-shared/z7a/Storms_data/data/",
-        help="ERA5 monthly NetCDF dir (default: project's data/)",
+        default=f"{REGCM_BASE}/{REGCM_MODEL}/WNet_6hourly_latlon/",
+        help="RegCM regridded monthly NetCDF dir (default: <MODEL>/WNet_6hourly_latlon)",
     )
     _parser.add_argument(
         "--checkpoint",
-        default=("/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/WNet_parallel_global_code/ARs_Hurricanes_ETCs_MCS/Trail9/final_checkpoint_2006_2024.pth"),
-        help="Path to .pth checkpoint (default: legacy MCS_enhanced_trial60 epoch 40)",
+        default=("/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/"
+                 f"WNet_parallel_global_RegCM/ARs_Hurricanes_ETCs_MCS/Trail_RegCM_PR_{REGCM_MODEL}/"
+                 # Training runs 1980-2004, so this is the filename it actually writes.
+                 "final_checkpoint_1980_2004.pth"),
+        help=("Path to trained .pth checkpoint (default: this model's precip-MCS run, "
+              "Trail_RegCM_PR_<MODEL>). The BT-era Trail_RegCM_<MODEL> checkpoints are "
+              "kept as the A/B baseline — pass them explicitly to evaluate that branch. "
+              "For CNR/MRI use the highest ema_checkpoint_epoch_*.pth (wall-killed runs)."),
     )
     _parser.add_argument(
         "--output-dir",
-        default=("/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/WNet_parallel_global_code/ARs_Hurricanes_ETCs_MCS/Outputs"),
-        help="Where to write per-class detection NetCDFs",
+        default=("/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/"
+                 f"WNet_parallel_global_RegCM/ARs_Hurricanes_ETCs_MCS/Outputs_RegCM_PR_{REGCM_MODEL}"),
+        help=("Where to write per-class detection NetCDFs (default: the precip-MCS run. "
+              "The BT-era Outputs_RegCM_<MODEL> results are kept for A/B comparison)"),
     )
-    _parser.add_argument("--start-year", type=int, default=2004)
-    _parser.add_argument("--end-year",   type=int, default=2017)
+    _parser.add_argument("--start-year", type=int, default=1980)   # held-out test period
+    _parser.add_argument("--end-year",   type=int, default=2014)
     _parser.add_argument("--start-month", type=int, default=1, help="First month to process (1-12)")
     _parser.add_argument("--end-month",   type=int, default=12, help="Last month to process (1-12)")
     _parser.add_argument(

@@ -101,9 +101,20 @@ def _filter_min_area(mask2d, area2d, min_area_km2):
     return np.isin(labels, keep_ids).astype(np.float32)
 
 
+def _haversine_km(lon1, lat1, lon2, lat2):
+    """Great-circle distance in km between two (lon, lat) points."""
+    R = 6371.0
+    p1, p2 = np.radians(lat1), np.radians(lat2)
+    dp = np.radians(lat2 - lat1)
+    dl = np.radians(lon2 - lon1)
+    a = np.sin(dp / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2
+    return 2 * R * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+
+
 def track_mcs_timeseries(mcs_stack, latitudes, longitudes,
                          min_area_km2=60000.0, link_overlap=0.5,
-                         min_lifetime_steps=2, verbose=True):
+                         min_lifetime_steps=2, min_net_displacement_km=400.0,
+                         verbose=True):
     """Full MCS criteria + overlap tracking → a storm-ID field (like Feng's
     `cloudtracknumber`), so the SHARED benchmark metric code can compute true
     ID-based storm-hours for WNet exactly as for the other methods.
@@ -117,6 +128,10 @@ def track_mcs_timeseries(mcs_stack, latitudes, longitudes,
          Merges/splits resolve to the maximum-overlap parent.
       3. Minimum lifetime: drop whole tracks present in fewer than
          `min_lifetime_steps` frames (2 ≈ 6 h at 6-hourly cadence).
+      4. Minimum net propagation: drop tracks whose start→end displacement is
+         below `min_net_displacement_km`. MCSs propagate; orographic convection
+         is terrain-anchored, so this removes quasi-stationary terrain-locked
+         systems that the area/lifetime tests admit. Set to None/0 to disable.
 
     Tracking is per monthly file; IDs restart each month. That is sufficient for
     the monthly storm-hours metric (it groups by (month, id)); a system crossing
@@ -211,6 +226,42 @@ def track_mcs_timeseries(mcs_stack, latitudes, longitudes,
             drop = np.isin(ids, short)
             ids[drop] = 0
 
+    # ── Step 4: minimum net propagation (drop quasi-stationary systems) ───────
+    # An MCS PROPAGATES; orographic convection is terrain-anchored. Measured on
+    # this pipeline's own tracks (ACC 2005-2010), winter Cascades systems move a
+    # median 275 km at 3.7 m/s while summer Midwest MCSs move 608 km at 6.3 m/s
+    # — same duration, 2.2x the displacement. That separates the two regimes on a
+    # different axis from rain rate / convective fraction, which is why it works
+    # where an 8-combo threshold sweep (core 1.0-3.0, cf 0.7-0.9) could not.
+    #
+    # This is the MCS analogue of the ETC tracker's kinematic criteria
+    # (min_path_km / min_avg_propagation_ms / min_net_east_km), and it is applied
+    # AFTER linking for the same reason: it is a property of a whole track.
+    #
+    # Net (start->end) displacement, not path length, so a system that wanders
+    # and returns is correctly rejected.
+    if min_net_displacement_km and min_net_displacement_km > 0 and next_id > 1:
+        lat = np.asarray(latitudes, dtype=np.float64)
+        lon = np.asarray(longitudes, dtype=np.float64)
+        first = {}   # id -> (lon, lat) at first appearance
+        last = {}    # id -> (lon, lat) at last appearance
+        for t in range(T):
+            present = np.unique(ids[t])
+            present = present[present > 0]
+            for gid in present:
+                rows, cols = np.nonzero(ids[t] == gid)
+                # centroid in index space -> geographic coords
+                clat = lat[int(round(rows.mean()))]
+                clon = lon[int(round(cols.mean()))]
+                if gid not in first:
+                    first[gid] = (clon, clat)
+                last[gid] = (clon, clat)
+
+        stationary = [gid for gid in first
+                      if _haversine_km(*first[gid], *last[gid]) < min_net_displacement_km]
+        if stationary:
+            ids[np.isin(ids, stationary)] = 0
+
     binary = (ids > 0).astype(np.float32)
 
     if verbose:
@@ -219,8 +270,10 @@ def track_mcs_timeseries(mcs_stack, latitudes, longitudes,
                     else "no area filter, ")
         life_txt = (f"{min_lifetime_steps}-step lifetime"
                     if min_lifetime_steps and min_lifetime_steps > 1 else "no lifetime filter")
+        prop_txt = (f" + {min_net_displacement_km:.0f} km propagation"
+                    if (min_net_displacement_km and min_net_displacement_km > 0) else "")
         print(f"[MCS] raw pixels: {int((stack > 0).sum())} -> "
-              f"{area_txt}overlap-track + {life_txt}: {int((binary > 0).sum())} pixels, "
+              f"{area_txt}overlap-track + {life_txt}{prop_txt}: {int((binary > 0).sum())} pixels, "
               f"{n_tracks} tracks")
     return binary, ids
 

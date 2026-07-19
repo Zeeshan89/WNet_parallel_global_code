@@ -30,12 +30,28 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 
 
+def _fmt_thr(v):
+    """Format a threshold that may be a scalar OR a 2-D per-cell field, for logging."""
+    try:
+        if hasattr(v, 'ndim') and getattr(v, 'ndim', 0) >= 2:
+            return (f"PER-CELL FIELD {tuple(v.shape)} "
+                    f"(range {float(np.nanmin(v)):.2f}–{float(np.nanmax(v)):.2f} K, "
+                    f"median {float(np.nanmedian(v)):.2f} K)")
+        return f"GLOBAL SCALAR ({float(v):.2f} K)"
+    except Exception:
+        return str(v)
+
+
 class ARDatasetImproved(Dataset):
     """
     Enhanced AR Dataset with GPU optimization, distributed training support, temperature-based hurricane detection,
     wind shear integration, and improved ETC detection with spatial coherence and intensity clustering
     """
-    TENSOR_CACHE_DIR = "/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/tensor_cache_v2"
+    # Precip-MCS tensors live in their OWN dir, separate from the BT-branch cache:
+    # changing _create_mcs_masks invalidates every cached tensor, and a separate
+    # dir keeps the BT baseline available for A/B and makes rollback a path change.
+    # MUST stay in sync with precompute_tensors.TENSOR_DIR.
+    TENSOR_CACHE_DIR = f"/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/tensor_cache_RegCM_PR_{os.environ.get('REGCM_MODEL', 'ACC')}"
 
     def __init__(self, 
                 data: xr.Dataset, 
@@ -54,6 +70,7 @@ class ARDatasetImproved(Dataset):
                 mslp_climatology: Optional[np.ndarray] = None,
                 iwv_climatology: Optional[np.ndarray] = None,
                 mcs_moisture_mode: str = "anomaly",
+                mcs_source: str = "precip",
                 iwv_anom_threshold: float = 0.0,
                 iwv_anom_soft_band: float = 5.0,
                 ibtracs_lookup: Optional[dict] = None,
@@ -132,11 +149,20 @@ class ARDatasetImproved(Dataset):
             print("⚠ Missing BT (Brightness Temperature) data - using zeros")
             self.bt_ds = np.zeros_like(self.ivt)
         
-        # self.tpr = self._convert_to_numpy(extract_var(data, ['TPR', 'tpr']), dtype=np.float32)
-        # if self.tpr is None:
-        #     print("⚠ Missing TPR (Total Precipitation Rate) data - using zeros")
-        #     self.tpr = np.zeros_like(self.ivt)
-        
+        # Precipitation (mm/h) — the MCS source. `pr` total, `prc` convective.
+        # A zero-fill here would make every MCS mask empty, so the loaders gate
+        # on precip being present rather than letting this fall back silently.
+        self.pr = self._convert_to_numpy(extract_var(data, ['PR', 'pr']), dtype=np.float32)
+        if self.pr is None:
+            print("⚠ Missing pr (total precipitation) data - using zeros → MCS will be EMPTY")
+            self.pr = np.zeros_like(self.ivt)
+
+        self.prc = self._convert_to_numpy(extract_var(data, ['PRC', 'prc']), dtype=np.float32)
+        if self.prc is None:
+            print("⚠ Missing prc (convective precipitation) data - using zeros → MCS will be EMPTY")
+            self.prc = np.zeros_like(self.ivt)
+
+
         self.iwv = self._convert_to_numpy(extract_var(data, ['IWV', 'iwv']), dtype=np.float32)
         if self.iwv is None:
             print("⚠ Missing IWV (Integrated Water Vapor) data - using zeros")
@@ -164,18 +190,40 @@ class ARDatasetImproved(Dataset):
             self.windspeed_threshold = None
 
         
-        # MCS thresholds - TWO thresholds for boundary and core
-        if 'BT_boundary' in self.global_percentiles:
-            # Boundary threshold (241K equivalent)
-            self.bt_boundary_threshold = float(self.global_percentiles['BT_boundary'])
-        else:
-            self.bt_boundary_threshold = None
+        # MCS thresholds - TWO thresholds for boundary and core.
+        # Accept EITHER a scalar (ERA5-style absolute 241/225 K) OR a 2-D per-cell
+        # field (RegCM). The RegCM cloud-top proxy's cold bias is latitude-dependent
+        # (~0 K in the tropics, ~15 K at 40-45 N), so a single scalar over-detects the
+        # tropics and starves the continental mid-latitudes. A per-cell threshold field
+        # (same idea as the vor850/windspeed 75th-percentile fields) removes that skew.
+        # Comparisons like `bt <= thr` broadcast fine against a (lat, lon) array.
+        def _as_threshold(val):
+            if val is None:
+                return None
+            # Short-circuit plain numbers. _convert_to_numpy does `data.values`,
+            # which raises on a float and logs a scary "Error converting data to
+            # numpy" before the float(val) fallback below quietly does the right
+            # thing — misleading noise, once per scalar threshold per file.
+            if isinstance(val, (int, float, np.integer, np.floating)):
+                return float(val)
+            arr = self._convert_to_numpy(val, dtype=np.float32)
+            if arr is not None and getattr(arr, 'ndim', 0) >= 2:
+                return np.squeeze(arr)          # 2-D per-cell field
+            return float(val)                    # scalar
 
-        if 'BT_core' in self.global_percentiles:
-            # Core threshold (225K equivalent) 
-            self.bt_core_threshold = float(self.global_percentiles['BT_core'])
-        else:
-            self.bt_core_threshold = None
+        self.bt_boundary_threshold = (_as_threshold(self.global_percentiles['BT_boundary'])
+                                      if 'BT_boundary' in self.global_percentiles else None)
+        self.bt_core_threshold = (_as_threshold(self.global_percentiles['BT_core'])
+                                  if 'BT_core' in self.global_percentiles else None)
+
+        # MCS precipitation thresholds (mcs_source="precip", the default). Same
+        # scalar-or-2D plumbing as BT: `prc >= thr` broadcasts over (lat, lon)
+        # exactly as `bt <= thr` does. These are fixed physical constants by
+        # design — see utils.load_regcm_pr_thresholds for why there is
+        # deliberately no per-cell calibration analogue of compute_bt_thresholds.
+        self.pr_shield_threshold = _as_threshold(self.global_percentiles.get('PR_shield'))
+        self.pr_core_threshold = _as_threshold(self.global_percentiles.get('PR_core'))
+        self.pr_convfrac_threshold = _as_threshold(self.global_percentiles.get('PR_convfrac'))
 
         
             
@@ -207,6 +255,17 @@ class ARDatasetImproved(Dataset):
         self.mcs_moisture_mode = mcs_moisture_mode      # "anomaly" | "anomaly_soft" | "absolute"
         self.iwv_anom_threshold = float(iwv_anom_threshold)
         self.iwv_anom_soft_band = float(iwv_anom_soft_band)
+
+        # MCS detection source. "precip" (default) uses convective precipitation;
+        # "bt" is the legacy cloud-top-proxy branch, kept only for A/B comparison.
+        # RegCM's BT proxy peaks in WINTER over the Great Plains and bottoms out in
+        # July — anti-correlated with the MCS season — so "bt" cannot recover the
+        # continental signal at any threshold.
+        if mcs_source not in ("precip", "bt"):
+            raise ValueError(f"mcs_source must be 'precip' or 'bt', got {mcs_source!r}")
+        self.mcs_source = mcs_source
+        print(f"MCS detection source: {self.mcs_source}"
+              + (" (legacy cloud-top proxy — A/B only)" if self.mcs_source == "bt" else ""))
         if iwv_climatology is not None:
             print(f"Using pre-aligned IWV monthly climatology — MCS moisture gate = '{mcs_moisture_mode}'")
             self.iwv_clim = self._convert_to_numpy(iwv_climatology, dtype=np.float32)
@@ -281,7 +340,7 @@ class ARDatasetImproved(Dataset):
                 try:
                     loaded = np.load(npy_path, mmap_mode='r')   # memory-mapped: no RAM copy
 
-                    # Validate shape matches current dataset
+                    # Validate shape matches current dataset (14 channels, MCS on)
                     expected_shape = (self.total_samples, 14,
                                     self.target_size[0], self.target_size[1])
 
@@ -343,14 +402,14 @@ class ARDatasetImproved(Dataset):
         N = self.total_samples
         H_target, W_target = self.target_size
         
-        # Allocate storage for all precomputed tensors
+        # Allocate storage for all precomputed tensors (14 channels, MCS on)
         self.precomputed_data = np.empty(
             (N, 14, H_target, W_target), dtype=np.float32
         )
-        
+
         print(f"Pre-computing 14-channel tensors for {N} samples "
             f"(target size {H_target}×{W_target})...")
-        
+
         for idx in range(N):
             try:
                 tensor = self._compute_single_sample(idx)
@@ -412,6 +471,7 @@ class ARDatasetImproved(Dataset):
         else:
             etc_lat_mask_2d = self.etc_lat_mask.astype(np.float32)
         
+        # ── MCS re-enabled (RegCM BT now available) ────────────────────────────
         mcs_lat_mask_2d = np.zeros((height, width), dtype=np.float32)
         if len(self.mcs_lat_mask.shape) == 1:
             for i in range(min(height, len(self.mcs_lat_mask))):
@@ -419,7 +479,7 @@ class ARDatasetImproved(Dataset):
                     mcs_lat_mask_2d[i, :] = 1.0
         else:
             mcs_lat_mask_2d = self.mcs_lat_mask.astype(np.float32)
-        
+
         # Storm masks
         hurricane_masks = self._create_hurricane_masks(idx, hurricane_lat_mask_2d)
         etc_masks = self._create_etc_masks(idx, etc_lat_mask_2d)
@@ -724,7 +784,7 @@ class ARDatasetImproved(Dataset):
 
         # Boundary threshold (241K)
         if self.bt_boundary_threshold is not None:
-            print(f"✓ Using global boundary brightness temperature threshold: {self.bt_boundary_threshold:.2f} K")
+            print(f"✓ Using global boundary brightness temperature threshold: {_fmt_thr(self.bt_boundary_threshold)}")
             self.bt_boundary_threshold_local = None
         else:
             self.bt_boundary_threshold_local = 241.0  # Fixed meteorological threshold
@@ -732,7 +792,7 @@ class ARDatasetImproved(Dataset):
 
         # Core threshold (225K)
         if self.bt_core_threshold is not None:
-            print(f"✓ Using global core brightness temperature threshold: {self.bt_core_threshold:.2f} K")
+            print(f"✓ Using global core brightness temperature threshold: {_fmt_thr(self.bt_core_threshold)}")
             self.bt_core_threshold_local = None
         else:
             self.bt_core_threshold_local = 225.0  # Fixed meteorological threshold
@@ -786,12 +846,12 @@ class ARDatasetImproved(Dataset):
         #     print(f"  Total Precipitation Rate: LOCAL FIXED ({self.tpr_heavy_threshold:.4f} mm/h)")
 
         if self.bt_boundary_threshold is not None:
-            print(f"  Brightness Temperature (Boundary): GLOBAL SCALAR ({self.bt_boundary_threshold:.2f} K)")
+            print(f"  Brightness Temperature (Boundary): {_fmt_thr(self.bt_boundary_threshold)}")
         else:
             print(f"  Brightness Temperature (Boundary): LITERATURE FIXED ({self.bt_boundary_threshold_local:.1f} K)")
 
         if self.bt_core_threshold is not None:
-            print(f"  Brightness Temperature (Core): GLOBAL SCALAR ({self.bt_core_threshold:.2f} K)")
+            print(f"  Brightness Temperature (Core): {_fmt_thr(self.bt_core_threshold)}")
         else:
             print(f"  Brightness Temperature (Core): LITERATURE FIXED ({self.bt_core_threshold_local:.1f} K)")
         
@@ -1383,6 +1443,44 @@ class ARDatasetImproved(Dataset):
         core_mask   = (bt_field   <= core_threshold) & \
                     (bt_anomaly <= anomaly_core_threshold)
 
+        return self._blobs_from_shield_core(
+            shield_mask, core_mask, bt_field,
+            min_core_pixels=min_core_pixels,
+            min_blob_area=min_blob_area,
+            min_enclosure_distance=min_enclosure_distance,
+        )
+
+    def _blobs_from_shield_core(
+        self,
+        shield_mask: np.ndarray,
+        core_mask: np.ndarray,
+        intensity_field: np.ndarray,
+        min_core_pixels: int = 3,
+        min_blob_area: int = 50,
+        min_enclosure_distance: int = 2,
+    ) -> Tuple[np.ndarray, Dict]:
+        """
+        Shield/core blob assembly — shared by the BT and precipitation branches.
+
+        Everything here is threshold-agnostic: it takes two boolean masks and
+        knows nothing about what field produced them or which sign convention
+        was used ("cold = event" for BT, "wet = event" for precip). Only the
+        mask construction differs between branches, so only that is duplicated.
+
+        Steps:
+          2. label both masks (8-connected)
+          3. match each core blob → its best-overlapping shield blob
+          4-6. per shield: reject if smaller than `min_blob_area`; reject cores
+               smaller than `min_core_pixels` or sitting on the shield edge
+               (`min_enclosure_distance` via EDT); Voronoi-split multi-core
+               shields and re-check each piece.
+
+        `intensity_field` is only used for the per-system diagnostics.
+        """
+        from scipy.ndimage import label, distance_transform_edt
+
+        conn8 = np.ones((3, 3), dtype=np.int32)
+
         # ------------------------------------------------------------------
         # STEP 2 – label connected components
         # ------------------------------------------------------------------
@@ -1390,7 +1488,7 @@ class ARDatasetImproved(Dataset):
         labeled_core,   num_cores  = label(core_mask.astype(np.int32),   structure=conn8)
 
         if num_shield == 0 or num_cores == 0:
-            return np.zeros_like(bt_field, dtype=np.float32), {}
+            return np.zeros_like(intensity_field, dtype=np.float32), {}
 
         # ------------------------------------------------------------------
         # STEP 3 – match each C-blob → best-overlapping S-blob
@@ -1414,7 +1512,7 @@ class ARDatasetImproved(Dataset):
             core_to_shield = {c: v[0] for c, v in best.items()}
 
         if not core_to_shield:
-            return np.zeros_like(bt_field, dtype=np.float32), {}
+            return np.zeros_like(intensity_field, dtype=np.float32), {}
 
         shield_to_cores: Dict[int, list] = {}
         for c_id, s_id in core_to_shield.items():
@@ -1423,7 +1521,7 @@ class ARDatasetImproved(Dataset):
         # ------------------------------------------------------------------
         # STEPS 4 + 5 + 6 – validate, filter, split
         # ------------------------------------------------------------------
-        valid_blob_mask = np.zeros_like(bt_field, dtype=np.float32)
+        valid_blob_mask = np.zeros_like(intensity_field, dtype=np.float32)
         blob_properties: Dict[int, dict] = {}
         system_id = 0
 
@@ -1463,7 +1561,7 @@ class ARDatasetImproved(Dataset):
                     shield_mask=shield_blob_mask,
                     core_mask=valid_cores[0][1],
                     core_area=valid_cores[0][2],
-                    bt_field=bt_field,
+                    intensity_field=intensity_field,
                     valid_blob_mask=valid_blob_mask,
                     blob_properties=blob_properties,
                     num_original_cores=1,
@@ -1504,7 +1602,7 @@ class ARDatasetImproved(Dataset):
                         shield_mask=sub_shield_mask,
                         core_mask=c_blob_mask,
                         core_area=core_area,
-                        bt_field=bt_field,
+                        intensity_field=intensity_field,
                         valid_blob_mask=valid_blob_mask,
                         blob_properties=blob_properties,
                         num_original_cores=len(valid_cores),
@@ -1512,25 +1610,99 @@ class ARDatasetImproved(Dataset):
 
         return valid_blob_mask, blob_properties
 
+    @staticmethod
+    def _convective_fraction(prc_field: np.ndarray, pr_field: np.ndarray) -> np.ndarray:
+        """Convective share of total precipitation, in [0, 1].
+
+        Zero where it is essentially not raining, so that dividing noise by noise
+        cannot manufacture a "fully convective" dry pixel. Clipped because pr and
+        prc are remapped independently and rounding can put prc a hair above pr.
+        """
+        cf = np.where(pr_field > 1e-3,
+                      prc_field / np.maximum(pr_field, 1e-6),
+                      0.0)
+        return np.clip(cf, 0.0, 1.0).astype(np.float32)
+
+    def _detect_mcs_blobs_precip(
+        self,
+        prc_field: np.ndarray,          # convective precip, mm/h
+        pr_field: np.ndarray,           # total precip, mm/h
+        shield_threshold: float,        # e.g. 0.1 mm/h  (scalar or 2-D)
+        core_threshold: float,          # e.g. 1.0 mm/h  (scalar or 2-D)
+        convfrac_threshold: float,      # e.g. 0.7       (scalar or 2-D)
+        min_core_pixels: int = 3,
+        min_blob_area: int = 50,
+        min_enclosure_distance: int = 2,
+    ) -> Tuple[np.ndarray, Dict, np.ndarray]:
+        """
+        Detect MCS blobs from convective precipitation.
+
+        The precipitation analogue of `_detect_mcs_blobs`, with the comparisons
+        inverted (`>=` — wet is the event, where for BT cold was the event):
+
+            shield: prc >= shield_threshold AND convective fraction >= convfrac_threshold
+            core:   prc >= core_threshold
+
+        Two deliberate differences from the BT version:
+
+        * **No local-anomaly filter.** BT needed one (`bt_anomaly <= -8/-15 K`) to
+          kill large uniform cold sheets, because BT has no natural floor and a
+          big slowly-varying background. Precipitation's background is ~0 over
+          most of the domain, so a uniform_filter background is ~0 and the
+          anomaly degenerates to a rescaled copy of the field itself — the test
+          would add nothing while costing a 31x31 convolution per timestep.
+
+        * **A convective-fraction gate instead.** This is the load-bearing part:
+          it is what makes this an MCS detector rather than a rain detector.
+          RegCM's PNW winter rain is stratiform orographic upslope (convective
+          fraction ~40-48%) while Great Plains summer convection is ~91-97%, so
+          the gate separates the two on physics rather than on geography. It is
+          exactly the discriminator the cloud-top proxy cannot express.
+
+        The gate is applied to the shield only — a cell already raining at
+        >= 1 mm/h of *convective* precip is convective by construction, so
+        gating the core too would be redundant and would only cost recall.
+
+        Returns (valid_blob_mask, blob_properties, convective_fraction); the
+        caller reuses the fraction for the boundary-only channel.
+        """
+        convfrac = self._convective_fraction(prc_field, pr_field)
+
+        shield_mask = (prc_field >= shield_threshold) & (convfrac >= convfrac_threshold)
+        core_mask   = (prc_field >= core_threshold)
+
+        blob_mask, blob_properties = self._blobs_from_shield_core(
+            shield_mask, core_mask, prc_field,
+            min_core_pixels=min_core_pixels,
+            min_blob_area=min_blob_area,
+            min_enclosure_distance=min_enclosure_distance,
+        )
+        return blob_mask, blob_properties, convfrac
+
     def _accept_system(
         self,
         system_id: int,
         shield_mask: np.ndarray,
         core_mask: np.ndarray,
         core_area: int,
-        bt_field: np.ndarray,
+        intensity_field: np.ndarray,
         valid_blob_mask: np.ndarray,
         blob_properties: dict,
         num_original_cores: int,
     ) -> None:
+        """Record one accepted system. `intensity_field` is BT (K) for the legacy
+        branch and convective precip (mm/h) for the precip branch — so the stats
+        are named neutrally rather than as temperatures. These diagnostics are
+        currently discarded by _create_mcs_masks; they exist for debugging."""
         valid_blob_mask[shield_mask] = 1.0
         shield_area = int(shield_mask.sum())
-        bt_vals     = bt_field[shield_mask]
+        vals        = intensity_field[shield_mask]
         blob_properties[system_id] = {
             'shield_area'   : shield_area,
             'core_area'     : core_area,
-            'min_temp'      : float(bt_vals.min()),
-            'mean_temp'     : float(bt_vals.mean()),
+            'min_value'     : float(vals.min()),
+            'max_value'     : float(vals.max()),
+            'mean_value'    : float(vals.mean()),
             'num_cores'     : num_original_cores,
             'core_fraction' : core_area / shield_area if shield_area > 0 else 0.0,
         }
@@ -1661,6 +1833,9 @@ class ARDatasetImproved(Dataset):
                 'min_core_pixels': 3,         # Compact intense cores
                 'bt_boundary': 241.0,         # Standard boundary
                 'bt_core': 223.0,             # STRICTER core (was 225K)
+                'pr_shield': 0.1,             # mm/h convective (precip branch)
+                'pr_core': 1.0,               # mm/h convective — standard core rate
+                'pr_convfrac': 0.7,           # prc/pr — separates convection from upslope
                 'moisture_threshold': 0.5,    # legacy absolute gate
                 'moisture_anom_threshold': 2.0,   # require above-normal moisture in summer
                 'shear_threshold': 0.6,       # Favorable shear needed
@@ -1673,6 +1848,13 @@ class ARDatasetImproved(Dataset):
                 'min_core_pixels': 8,         # Larger cores
                 'bt_boundary': 241.0,         # Standard boundary
                 'bt_core': 228.0,             # RELAXED core (was 225K)
+                'pr_shield': 0.1,             # mm/h convective (precip branch)
+                # NOT relaxed (cf. bt_core 223→228 in winter). Cold-season MCS do
+                # have weaker updrafts, so a relaxation to ~0.5 is plausible — but
+                # the validated diagnostic used 1.0 in every season, so keep 1.0
+                # here and test any relaxation as an isolated, measured delta.
+                'pr_core': 1.0,
+                'pr_convfrac': 0.7,
                 'moisture_threshold': 0.3,    # legacy absolute gate
                 'moisture_anom_threshold': -2.0,  # allow near/slightly-below-normal (cold, dry season)
                 'shear_threshold': 0.4,       # More lenient shear
@@ -1685,6 +1867,9 @@ class ARDatasetImproved(Dataset):
                 'min_core_pixels': 5,         # Medium cores
                 'bt_boundary': 241.0,         # Standard boundary
                 'bt_core': 225.0,             # Standard core
+                'pr_shield': 0.1,             # mm/h convective (precip branch)
+                'pr_core': 1.0,               # mm/h convective
+                'pr_convfrac': 0.7,
                 'moisture_threshold': 0.4,    # legacy absolute gate
                 'moisture_anom_threshold': 0.0,   # above-normal moisture
                 'shear_threshold': 0.5,       # Moderate shear
@@ -1696,22 +1881,31 @@ class ARDatasetImproved(Dataset):
     def _create_mcs_masks(self, idx: int, lat_mask_2d: np.ndarray) -> Dict[str, np.ndarray]:
         """
         Create MCS detection masks with SEASONAL ADAPTIVITY.
-        
-        Summer: Smaller, more intense systems (strict thresholds)
-        Winter: Larger, organized systems (relaxed thresholds)
-        
+
+        Two sources, selected by `self.mcs_source`:
+          "precip" (default) — convective-precip shield/core. RegCM's own
+              convection scheme is the MCS proxy; seasonality is correct
+              (Great Plains DJF ~0.2 vs JJA ~12.3 MCS days).
+          "bt" (legacy)      — cloud-top-temperature proxy, kept for A/B only.
+              Its Great Plains cold signal is winter frontal cirrus and bottoms
+              out in July, i.e. anti-correlated with the MCS season.
+
+        Returns the same three keys either way — 'mcs_boundary' / 'mcs_blobs' /
+        'mcs_core' → input channels 11 / 12 / 13 — so nothing downstream
+        (the channel stack, loss.py) changes with the source.
+
         Method:
         1. Determine season and get adaptive parameters
         2. Boundary/core thresholds adapt to season
         3. Size requirements vary by season
         4. Moisture and shear requirements adjust
         """
-        
+
         # ============================
         # 1. GET SEASONAL PARAMETERS
         # ============================
         seasonal_params = self._get_seasonal_mcs_parameters(idx)
-        
+
         # Extract seasonal thresholds
         bt_boundary_seasonal = seasonal_params['bt_boundary']
         bt_core_seasonal = seasonal_params['bt_core']
@@ -1719,29 +1913,50 @@ class ARDatasetImproved(Dataset):
         min_core_pixels_seasonal = seasonal_params['min_core_pixels']
         moisture_thresh_seasonal = seasonal_params['moisture_threshold']
         shear_thresh_seasonal = seasonal_params['shear_threshold']
-        
+
         # Override with global thresholds if provided (boundary/core only)
         if self.bt_boundary_threshold is not None:
             bt_boundary = self.bt_boundary_threshold
         else:
             bt_boundary = bt_boundary_seasonal
-        
+
         if self.bt_core_threshold is not None:
             bt_core = self.bt_core_threshold
         else:
             bt_core = bt_core_seasonal
-        
+
+        # Precip thresholds: global override (utils.load_regcm_pr_thresholds) wins,
+        # else the seasonal defaults. Same precedence as BT above.
+        pr_shield = (self.pr_shield_threshold if self.pr_shield_threshold is not None
+                     else seasonal_params['pr_shield'])
+        pr_core = (self.pr_core_threshold if self.pr_core_threshold is not None
+                   else seasonal_params['pr_core'])
+        pr_convfrac = (self.pr_convfrac_threshold if self.pr_convfrac_threshold is not None
+                       else seasonal_params['pr_convfrac'])
+
         # ============================
         # 2. SEASONAL BLOB DETECTION
         # ============================
-        mcs_blob_mask, blob_properties = self._detect_mcs_blobs(
-            self.bt_ds[idx], 
-            boundary_threshold=bt_boundary,
-            core_threshold=bt_core,
-            min_core_pixels=min_core_pixels_seasonal,  # SEASONAL
-            min_blob_area=min_blob_area_seasonal       # SEASONAL
-        )
-        
+        convfrac = None
+        if self.mcs_source == "precip":
+            mcs_blob_mask, blob_properties, convfrac = self._detect_mcs_blobs_precip(
+                self.prc[idx],
+                self.pr[idx],
+                shield_threshold=pr_shield,
+                core_threshold=pr_core,
+                convfrac_threshold=pr_convfrac,
+                min_core_pixels=min_core_pixels_seasonal,  # SEASONAL
+                min_blob_area=min_blob_area_seasonal       # SEASONAL
+            )
+        else:
+            mcs_blob_mask, blob_properties = self._detect_mcs_blobs(
+                self.bt_ds[idx],
+                boundary_threshold=bt_boundary,
+                core_threshold=bt_core,
+                min_core_pixels=min_core_pixels_seasonal,  # SEASONAL
+                min_blob_area=min_blob_area_seasonal       # SEASONAL
+            )
+
         # ============================
         # 3. MOISTURE ASSESSMENT
         # ============================
@@ -1801,35 +2016,54 @@ class ARDatasetImproved(Dataset):
         # ============================
         # 6. SEASONALLY-ADAPTIVE CORE MCS MASK
         # ============================
-        # Use seasonal thresholds for primary detection
-        mcs_core_seasonal = (
-            mcs_blob_mask * 
-            mcs_seasonal_moisture 
-            # *
-            # mcs_seasonal_shear
-        ).astype(np.float32)
-        
-        # MODERATE: Fixed moderate criteria (for comparison)
-        mcs_core_moderate = (
-            mcs_blob_mask * 
-            mcs_marginal_moisture
-        ).astype(np.float32)
-        
-        # FINAL CORE: Use seasonal adaptive mask
-        mcs_core_mask = mcs_core_seasonal
-        
-        
+        if self.mcs_source == "precip":
+            # NO IWV gate here, deliberately.
+            #
+            # `blobs * moisture` made sense for BT: a cold cloud top is not proof
+            # of rain, so the IWV anomaly supplied the missing moisture evidence.
+            # A precip blob needs no such inference — it ALREADY RAINED, which is
+            # strictly stronger evidence than an IWV anomaly.
+            #
+            # Re-adding the gate would also re-import the cool-season suppression
+            # that the winter `moisture_anom_threshold = -2.0` hack exists to work
+            # around, and would corrupt the summer-peaked seasonality that is the
+            # entire point of the precip branch.
+            mcs_core_mask = mcs_blob_mask.astype(np.float32)
+        else:
+            # Use seasonal thresholds for primary detection
+            mcs_core_seasonal = (
+                mcs_blob_mask *
+                mcs_seasonal_moisture
+                # *
+                # mcs_seasonal_shear
+            ).astype(np.float32)
+
+            # MODERATE: Fixed moderate criteria (for comparison)
+            mcs_core_moderate = (
+                mcs_blob_mask *
+                mcs_marginal_moisture
+            ).astype(np.float32)
+
+            # FINAL CORE: Use seasonal adaptive mask
+            mcs_core_mask = mcs_core_seasonal
+
+
         # ============================
         # 7. BOUNDARY-ONLY MASK
         # ============================
-        mcs_boundary_only = (self.bt_ds[idx] <= bt_boundary).astype(np.float32)
+        # Threshold-only shield: no size or enclosure test, so it is always a
+        # superset of mcs_blobs.
+        if self.mcs_source == "precip":
+            mcs_boundary_only = ((self.prc[idx] >= pr_shield) &
+                                 (convfrac >= pr_convfrac)).astype(np.float32)
+        else:
+            mcs_boundary_only = (self.bt_ds[idx] <= bt_boundary).astype(np.float32)
         mcs_boundary_only *= lat_mask_2d
-        
+
         return {
-            'mcs_boundary': mcs_boundary_only,        # Boundary threshold only
+            'mcs_boundary': mcs_boundary_only,        # Threshold-only shield
             'mcs_blobs': mcs_blob_mask,               # Seasonally-sized blobs
-            'mcs_core': mcs_core_mask,                # Seasonal adaptive detection (blob + moisture)
-            # 'mcs_core_moderate': mcs_core_moderate,   # Fixed moderate (for comparison)
+            'mcs_core': mcs_core_mask,                # Training target (channel 13)
             # 'season': seasonal_params['season'],      # Season label (for debugging)
         }
 
@@ -1977,7 +2211,7 @@ def preprocess_data_improved(ivt: xr.DataArray,
                            windhshear_ds: Optional[xr.DataArray] = None,
                         #    SST_ds: Optional[xr.DataArray] = None,
                            BT_ds: Optional[xr.DataArray] = None,
-                        #    TPR: Optional[xr.DataArray] = None,
+                           PR_ds: Optional[xr.Dataset] = None,
                            IWV: Optional[xr.DataArray] = None,
                            km_per_pixel: float = 1.0) -> xr.Dataset:
 
@@ -1994,8 +2228,9 @@ def preprocess_data_improved(ivt: xr.DataArray,
         temp_500mb: warmcore t300-t500 temperature data
         windhshear_ds: windshear magnitude data 
         # SST_ds: SST data 
-        BT_ds: Brightness Temp data 
-        TPR: Total Precipitation rate data 
+        BT_ds: Brightness Temp data
+        PR_ds: Precipitation dataset with `pr` (total) and `prc` (convective),
+               both in mm/h — the source for the MCS branch
         IWV: Integrated Water Vapor data
         vorticity_threshold: Vorticity threshold
         
@@ -2123,16 +2358,105 @@ def preprocess_data_improved(ivt: xr.DataArray,
         
         # Clean coordinates first
         BT_ds = clean_coordinates(BT_ds)
+        # Align BT to the main IVT time axis. RegCM BT is stored in yearly files;
+        # the per-month slice does NOT match the WNet month grid exactly (differing
+        # count — e.g. Jan 121 vs 120 — and a 6 h offset). Nearest-time selection
+        # yields exactly one BT scene per main timestep so the positional index
+        # self.bt_ds[idx] stays aligned with ivt/mslp/etc.
+        try:
+            if 'time' in getattr(BT_ds, 'coords', {}) and 'time' in ivt.coords:
+                _main_t = ivt['time'].values
+                # sel(...nearest) keeps BT's original timestamps (which can repeat
+                # → duplicate index → merge fails), so relabel to the main axis.
+                BT_ds = (BT_ds.sel(time=_main_t, method='nearest')
+                              .assign_coords(time=_main_t))
+        except Exception as e:
+            print(f"BT time-alignment skipped: {e}")
+        # RegCM BT is a "diagnosed cloud-top temperature proxy" that is NaN over
+        # clear sky (no cloud top → ~45% of pixels). The downstream
+        # nan_to_num(nan=0) would turn clear sky into 0 K — colder than the 225 K
+        # MCS core threshold — flagging the whole clear-sky domain as deep
+        # convection. Fill clear sky with a warm constant well above the 241/225 K
+        # thresholds so it is never counted as an MCS. (ERA5 BT had no NaNs.)
+        BT_CLEARSKY_FILL_K = 290.0
+        BT_ds = BT_ds.fillna(BT_CLEARSKY_FILL_K)
         try:
             bt_min = float(BT_ds.min().values)
             bt_max = float(BT_ds.max().values)
-            print(f"BT processed - range: {bt_min:.2f} to {bt_max:.2f} K")
+            print(f"BT processed - range: {bt_min:.2f} to {bt_max:.2f} K "
+                  f"(clear-sky NaN → {BT_CLEARSKY_FILL_K:.0f} K)")
         except Exception as e:
             print(f"BT processed (could not compute range: {str(e)})")
     else:
         print("Missing BT data...")
 
-        
+    # ── Precipitation (pr / prc, mm/h) — the MCS source ───────────────────────
+    # Mirrors the BT block above: same time-alignment idiom, but the clear-sky
+    # fill inverts. BT needed a WARM fill (290 K) because NaN→0 would look like
+    # deep convection; precipitation's "nothing happening" value IS 0.0, which is
+    # already below every shield threshold, so NaN→0 is the safe direction.
+    pr = prc = None
+    if PR_ds is not None:
+        print("Processing precipitation data (pr, prc)...")
+
+        def _extract_precip(src, names):
+            for n in names:
+                if hasattr(src, 'data_vars') and n in src:
+                    return src[n]
+            if hasattr(src, 'data_vars'):
+                return src[list(src.data_vars)[0]]
+            return src
+
+        pr  = clean_coordinates(_extract_precip(PR_ds, ['pr', 'PR']))
+        prc = clean_coordinates(_extract_precip(PR_ds, ['prc', 'PRC']))
+
+        # Align to the main IVT time axis, exactly as BT does. The regrid step
+        # already relabels precip to the right edge of its time_bnds (06:00/12:00
+        # /...), so this should be an exact match; nearest + relabel keeps it
+        # robust and prevents duplicate timestamps from breaking the merge.
+        try:
+            if 'time' in ivt.coords:
+                _main_t = ivt['time'].values
+                for _name, _da in (('pr', pr), ('prc', prc)):
+                    if _da is not None and 'time' in getattr(_da, 'coords', {}):
+                        _aligned = (_da.sel(time=_main_t, method='nearest')
+                                       .assign_coords(time=_main_t))
+                        if _name == 'pr':
+                            pr = _aligned
+                        else:
+                            prc = _aligned
+        except Exception as e:
+            print(f"Precip time-alignment skipped: {e}")
+
+        pr  = pr.fillna(0.0)
+        prc = prc.fillna(0.0)
+
+        # Runtime tripwire for a units regression. Bounds are deliberately WIDE:
+        # this is a last-resort backstop, and the real structural check lives in
+        # verify_pr_regrid.py (regridded-vs-native max ratio, which catches a
+        # *_6hourly-sum leak as ~2.0 and a missing x3600 as ~1/3600).
+        #   < 0.5   -> the x3600 in Run_PR_regrid.sh was skipped (still kg m-2 s-1)
+        #   > 250   -> a *_6hourly-sum file leaked in (it is exactly 2x the rate)
+        # 100 mm/h was too tight and cried wolf: single-cell 6-h means of
+        # 100-155 mm/h are real convective extremes here (CNR 1992 peaks at 152.8
+        # mm/h natively, regridded to 140.8 — ratio 0.921, i.e. correctly sourced
+        # and bilinearly smoothed, not a leak).
+        try:
+            pr_max, prc_max = float(pr.max().values), float(prc.max().values)
+            print(f"Precip processed - pr max {pr_max:.2f} mm/h, "
+                  f"prc max {prc_max:.2f} mm/h")
+            if pr_max < 0.5:
+                print(f"  ⚠ pr max {pr_max:.3e} is suspiciously small — "
+                      f"is it still kg m-2 s-1? (expected mm/h)")
+            if pr_max > 250.0:
+                print(f"  ⚠ pr max {pr_max:.1f} mm/h exceeds any physical 6-h mean — "
+                      f"did a *_6hourly-sum file leak in?")
+        except Exception as e:
+            print(f"Precip processed (could not compute range: {str(e)})")
+    else:
+        print("Missing precipitation data — MCS channels will be empty!")
+
+
     # Process 500mb temperature data
     if temp_500mb is not None:
         print("Processing 500mb temperature data...")
@@ -2218,14 +2542,7 @@ def preprocess_data_improved(ivt: xr.DataArray,
     # Clean coordinates for all variables
     ivt_enhanced = clean_coordinates(ivt_enhanced)
     mslp = clean_coordinates(mslp)
-    # TPR = clean_coordinates(TPR)
-    # try:
-    #     tpr_min = float(TPR.min().values)
-    #     tpr_max = float(TPR.max().values)
-    #     print(f"TPR processed - range: {tpr_min:.2f} to {tpr_max:.2f} kg m⁻² h⁻¹")
-    # except Exception as e:
-    #     print(f"TPR processed (could not compute range: {str(e)})")
-    
+
     IWV = clean_coordinates(IWV)
     try:
         iwv_min = float(IWV.min().values)
@@ -2243,10 +2560,9 @@ def preprocess_data_improved(ivt: xr.DataArray,
         'ivt_grad': ivt_grad.astype(np.float32),
         'vorticity': vorticity.astype(np.float32),
         'vorticity_grad': vorticity_grad.astype(np.float32),
-        # 'TPR': TPR.astype(np.float32),
         'IWV': IWV.astype(np.float32),
     }
-    
+
     # Add optional variables only if they are not None
     if wind_speed is not None:
         dataset_dict['wind_speed'] = wind_speed.astype(np.float32)
@@ -2256,6 +2572,10 @@ def preprocess_data_improved(ivt: xr.DataArray,
         dataset_dict['windhshear'] = windhshear_ds.astype(np.float32)
     if BT_ds is not None:
         dataset_dict['BT_ds'] = BT_ds.astype(np.float32)
+    if pr is not None:
+        dataset_dict['PR'] = pr.astype(np.float32)
+    if prc is not None:
+        dataset_dict['PRC'] = prc.astype(np.float32)
     
     combined_ds = xr.Dataset(dataset_dict)
     

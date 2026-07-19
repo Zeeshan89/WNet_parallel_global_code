@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 """
+DEPRECATED — do not run this on output from the precipitation-based MCS branch.
+
+test.py now applies the full criteria inline (min_area_km2=60000.0 AND
+min_lifetime_steps=2, in the correct order, inside track_mcs_timeseries), so its
+output already satisfies the area criterion. This script is NOT equivalent to
+that path: it applies the 60k area filter post-hoc but never applies the
+minimum-lifetime criterion. Running it afterwards would be near-idempotent on
+area while silently implying the two pipelines are comparable when their
+lifetime criteria differ.
+
+Kept only for reprocessing pre-existing BT-branch outputs in Output_new_IWV.
+For anything new, point the metric pipeline at test.py's output directly.
+
+---
 Apply a 60,000 km^2 minimum-area criterion to existing IWV-gate MCS predictions
 WITHOUT re-running the GPUs. Reads *_MCS_detection.nc from IN_DIR, drops per-timestep
 tracked blobs (by MCS_id) whose latitude-weighted area < MIN_AREA_KM2, and writes the

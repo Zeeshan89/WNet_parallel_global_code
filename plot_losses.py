@@ -31,9 +31,13 @@ CLASS_MARKERS = {"ar": "o", "hurricane": "s", "etc": "^", "mcs": "D",
                  "total": "*", "overlap": "v"}
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-BASE_DIR    = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
-               "Storms_precipitation_notebooks/WNet_parallel_global_code/"
-               "ARs_Hurricanes_ETCs_MCS/Trail11")
+# Follows the run selected by REGCM_MODEL via the shared definition:
+#   REGCM_MODEL=BCC python plot_losses.py
+# This was hardcoded to the BT-era Trail_RegCM_ACC, so it silently plotted that
+# old run's loss history no matter which model had just been trained. To point it
+# at the baseline (or anywhere else), set WNET_PLOT_DIR.
+from utils import regcm_checkpoint_dir
+BASE_DIR    = os.environ.get("WNET_PLOT_DIR", regcm_checkpoint_dir())
 HISTORY_PKL = os.path.join(BASE_DIR, "loss_history.pkl")
 OUTPUT_DIR  = os.path.join(BASE_DIR, "loss_plots")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
