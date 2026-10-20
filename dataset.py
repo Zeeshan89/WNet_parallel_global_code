@@ -30,31 +30,55 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 
 
-def _fmt_thr(v):
-    """Format a threshold that may be a scalar OR a 2-D per-cell field, for logging."""
-    try:
-        if hasattr(v, 'ndim') and getattr(v, 'ndim', 0) >= 2:
-            return (f"PER-CELL FIELD {tuple(v.shape)} "
-                    f"(range {float(np.nanmin(v)):.2f}–{float(np.nanmax(v)):.2f} K, "
-                    f"median {float(np.nanmedian(v)):.2f} K)")
-        return f"GLOBAL SCALAR ({float(v):.2f} K)"
-    except Exception:
-        return str(v)
-
-
 class ARDatasetImproved(Dataset):
     """
     Enhanced AR Dataset with GPU optimization, distributed training support, temperature-based hurricane detection,
     wind shear integration, and improved ETC detection with spatial coherence and intensity clustering
     """
-    # Precip-MCS tensors live in their OWN dir, separate from the BT-branch cache:
-    # changing _create_mcs_masks invalidates every cached tensor, and a separate
-    # dir keeps the BT baseline available for A/B and makes rollback a path change.
-    # MUST stay in sync with precompute_tensors.TENSOR_DIR.
-    TENSOR_CACHE_DIR = f"/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/tensor_cache_RegCM_PR_{os.environ.get('REGCM_MODEL', 'ACC')}"
+    TENSOR_CACHE_DIR = "/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/tensor_cache_v2"
 
-    def __init__(self, 
-                data: xr.Dataset, 
+    # ── Phase 1: predictor / label split ─────────────────────────────────────
+    # In the legacy 14-channel contract each class's training target was ALSO an
+    # input channel (AR<-ch1, Hurricane<-ch5, ETC<-ch10, MCS<-ch13), so a single
+    # conv weight could satisfy the loss by copying it through. Phase 0 measured
+    # exactly that (see phase0_diagnostics/): zeroing a class's target channel
+    # drove its prediction to 0 pixels. In "split" mode the model sees ONLY
+    # continuous physical fields; the heuristic masks are returned separately and
+    # are visible solely to the loss and the metrics, which makes copying
+    # structurally impossible rather than merely discouraged.
+    SPLIT_CACHE_DIR = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                       "Storms_precipitation_notebooks/tensor_cache_v3_split")
+
+    # (name, attribute on self) — the 6 fields the science criteria actually use.
+    # Wind shear, 500 mb temperature, SST and precipitation are deliberately
+    # excluded: no active detector reads them.
+    # NOTE on IVT: `self.ivt` is NOT usable as a predictor. The preprocessed
+    # HDF5 cache was built with ivt_percentile=400, which zeroed every pixel
+    # below 400 kg/m/s — it is 93% zeros and has IoU 0.917 with the AR label.
+    # Feeding it would hand the model the AR answer and re-create exactly the
+    # shortcut Phase 1 exists to remove. `self.ivt_raw` is the true field,
+    # recomputed as sqrt(Qu^2 + Qv^2) from the source ERA5 file.
+    PREDICTOR_SPECS = [
+        ("IVT",        "ivt_raw"),      # ARs   (raw, NOT the 400-thresholded ivt)
+        ("MSLP",       "mslp"),         # ETCs, TCs
+        ("vorticity",  "vorticity"),    # ETCs, TCs (850 mb)
+        ("wind_speed", "wind_speed"),   # ETCs, TCs (850 mb)
+        ("BT",         "bt_ds"),        # MCS (cloud-top brightness temperature)
+        ("IWV",        "iwv"),          # MCS, ARs (moisture)
+    ]
+    PREDICTOR_NAMES = [n for n, _ in PREDICTOR_SPECS]
+    N_PREDICTORS = len(PREDICTOR_SPECS)
+
+    # Label order matches the segmentation class order (class index = i + 1).
+    LABEL_NAMES = ["AR", "Hurricane", "ETC", "MCS"]
+    # Where each label lives in the legacy 14-channel tensor. Lets the split
+    # cache reuse an existing v2 month instead of re-running ~23 min of scipy
+    # mask work per month.
+    LEGACY_LABEL_CHANNELS = [1, 5, 10, 13]
+    N_LABELS = len(LABEL_NAMES)
+
+    def __init__(self,
+                data: xr.Dataset,
                 ivt_percentile: Optional[xr.DataArray] = None, 
                 vorticity_threshold: Optional[float] = None, 
                 ars: Optional[xr.DataArray] = None, 
@@ -70,12 +94,13 @@ class ARDatasetImproved(Dataset):
                 mslp_climatology: Optional[np.ndarray] = None,
                 iwv_climatology: Optional[np.ndarray] = None,
                 mcs_moisture_mode: str = "anomaly",
-                mcs_source: str = "precip",
                 iwv_anom_threshold: float = 0.0,
                 iwv_anom_soft_band: float = 5.0,
                 ibtracs_lookup: Optional[dict] = None,
                 year=None,
-                month=None
+                month=None,
+                output_mode: str = "legacy",
+                predictor_stats: Optional[Dict[str, Dict[str, float]]] = None,
                 ):
         """
         Initialize the enhanced AR dataset with improved ETC detection using multi-level vorticity
@@ -95,6 +120,16 @@ class ARDatasetImproved(Dataset):
         self.preload_data = preload_data
         self.year  = year
         self.month = month
+
+        # Phase 1 contract. "legacy" -> one (14, H, W) tensor, input and target
+        # entangled. "split" -> (predictors (6, H, W), labels (4, H, W)).
+        if output_mode not in ("legacy", "split"):
+            raise ValueError(f"output_mode must be 'legacy' or 'split', got {output_mode!r}")
+        self.output_mode = output_mode
+        # Per-predictor {mean, std} used to standardise at __getitem__ time. The
+        # split cache stores RAW physical values on purpose, so the normalisation
+        # can be corrected without rebuilding ~200 GB of tensors.
+        self.predictor_stats = predictor_stats
 
         # Store global percentiles for threshold calculation
         self.global_percentiles = global_percentiles or {}
@@ -131,6 +166,11 @@ class ARDatasetImproved(Dataset):
         
         # Core data arrays - only what's needed
         self.ivt = self._convert_to_numpy(extract_var(data, 'ivt'), dtype=np.float32)
+        # Raw, unthresholded IVT for the Phase 1 predictor stack. `ivt` above is
+        # zeroed below 400 kg/m/s by the preprocessed cache and must never be
+        # used as a model input — see PREDICTOR_SPECS.
+        self.ivt_raw = self._convert_to_numpy(
+            extract_var(data, ['ivt_raw', 'IVT_raw']), dtype=np.float32)
         self.mslp = self._convert_to_numpy(extract_var(data, 'mslp'), dtype=np.float32)
         self.ivt_grad = self._convert_to_numpy(extract_var(data, 'ivt_grad'), dtype=np.float32)
         self.vorticity_grad = self._convert_to_numpy(extract_var(data, 'vorticity_grad'), dtype=np.float32)
@@ -149,20 +189,11 @@ class ARDatasetImproved(Dataset):
             print("⚠ Missing BT (Brightness Temperature) data - using zeros")
             self.bt_ds = np.zeros_like(self.ivt)
         
-        # Precipitation (mm/h) — the MCS source. `pr` total, `prc` convective.
-        # A zero-fill here would make every MCS mask empty, so the loaders gate
-        # on precip being present rather than letting this fall back silently.
-        self.pr = self._convert_to_numpy(extract_var(data, ['PR', 'pr']), dtype=np.float32)
-        if self.pr is None:
-            print("⚠ Missing pr (total precipitation) data - using zeros → MCS will be EMPTY")
-            self.pr = np.zeros_like(self.ivt)
-
-        self.prc = self._convert_to_numpy(extract_var(data, ['PRC', 'prc']), dtype=np.float32)
-        if self.prc is None:
-            print("⚠ Missing prc (convective precipitation) data - using zeros → MCS will be EMPTY")
-            self.prc = np.zeros_like(self.ivt)
-
-
+        # self.tpr = self._convert_to_numpy(extract_var(data, ['TPR', 'tpr']), dtype=np.float32)
+        # if self.tpr is None:
+        #     print("⚠ Missing TPR (Total Precipitation Rate) data - using zeros")
+        #     self.tpr = np.zeros_like(self.ivt)
+        
         self.iwv = self._convert_to_numpy(extract_var(data, ['IWV', 'iwv']), dtype=np.float32)
         if self.iwv is None:
             print("⚠ Missing IWV (Integrated Water Vapor) data - using zeros")
@@ -190,40 +221,18 @@ class ARDatasetImproved(Dataset):
             self.windspeed_threshold = None
 
         
-        # MCS thresholds - TWO thresholds for boundary and core.
-        # Accept EITHER a scalar (ERA5-style absolute 241/225 K) OR a 2-D per-cell
-        # field (RegCM). The RegCM cloud-top proxy's cold bias is latitude-dependent
-        # (~0 K in the tropics, ~15 K at 40-45 N), so a single scalar over-detects the
-        # tropics and starves the continental mid-latitudes. A per-cell threshold field
-        # (same idea as the vor850/windspeed 75th-percentile fields) removes that skew.
-        # Comparisons like `bt <= thr` broadcast fine against a (lat, lon) array.
-        def _as_threshold(val):
-            if val is None:
-                return None
-            # Short-circuit plain numbers. _convert_to_numpy does `data.values`,
-            # which raises on a float and logs a scary "Error converting data to
-            # numpy" before the float(val) fallback below quietly does the right
-            # thing — misleading noise, once per scalar threshold per file.
-            if isinstance(val, (int, float, np.integer, np.floating)):
-                return float(val)
-            arr = self._convert_to_numpy(val, dtype=np.float32)
-            if arr is not None and getattr(arr, 'ndim', 0) >= 2:
-                return np.squeeze(arr)          # 2-D per-cell field
-            return float(val)                    # scalar
+        # MCS thresholds - TWO thresholds for boundary and core
+        if 'BT_boundary' in self.global_percentiles:
+            # Boundary threshold (241K equivalent)
+            self.bt_boundary_threshold = float(self.global_percentiles['BT_boundary'])
+        else:
+            self.bt_boundary_threshold = None
 
-        self.bt_boundary_threshold = (_as_threshold(self.global_percentiles['BT_boundary'])
-                                      if 'BT_boundary' in self.global_percentiles else None)
-        self.bt_core_threshold = (_as_threshold(self.global_percentiles['BT_core'])
-                                  if 'BT_core' in self.global_percentiles else None)
-
-        # MCS precipitation thresholds (mcs_source="precip", the default). Same
-        # scalar-or-2D plumbing as BT: `prc >= thr` broadcasts over (lat, lon)
-        # exactly as `bt <= thr` does. These are fixed physical constants by
-        # design — see utils.load_regcm_pr_thresholds for why there is
-        # deliberately no per-cell calibration analogue of compute_bt_thresholds.
-        self.pr_shield_threshold = _as_threshold(self.global_percentiles.get('PR_shield'))
-        self.pr_core_threshold = _as_threshold(self.global_percentiles.get('PR_core'))
-        self.pr_convfrac_threshold = _as_threshold(self.global_percentiles.get('PR_convfrac'))
+        if 'BT_core' in self.global_percentiles:
+            # Core threshold (225K equivalent) 
+            self.bt_core_threshold = float(self.global_percentiles['BT_core'])
+        else:
+            self.bt_core_threshold = None
 
         
             
@@ -255,17 +264,6 @@ class ARDatasetImproved(Dataset):
         self.mcs_moisture_mode = mcs_moisture_mode      # "anomaly" | "anomaly_soft" | "absolute"
         self.iwv_anom_threshold = float(iwv_anom_threshold)
         self.iwv_anom_soft_band = float(iwv_anom_soft_band)
-
-        # MCS detection source. "precip" (default) uses convective precipitation;
-        # "bt" is the legacy cloud-top-proxy branch, kept only for A/B comparison.
-        # RegCM's BT proxy peaks in WINTER over the Great Plains and bottoms out in
-        # July — anti-correlated with the MCS season — so "bt" cannot recover the
-        # continental signal at any threshold.
-        if mcs_source not in ("precip", "bt"):
-            raise ValueError(f"mcs_source must be 'precip' or 'bt', got {mcs_source!r}")
-        self.mcs_source = mcs_source
-        print(f"MCS detection source: {self.mcs_source}"
-              + (" (legacy cloud-top proxy — A/B only)" if self.mcs_source == "bt" else ""))
         if iwv_climatology is not None:
             print(f"Using pre-aligned IWV monthly climatology — MCS moisture gate = '{mcs_moisture_mode}'")
             self.iwv_clim = self._convert_to_numpy(iwv_climatology, dtype=np.float32)
@@ -301,8 +299,11 @@ class ARDatasetImproved(Dataset):
         # PRE-COMPUTE all 14-channel tensors for every sample so __getitem__
         # becomes a cheap array lookup instead of expensive scipy operations.
         if precompute:
-            # self._precompute_all_channels()
-            self._precompute_all_channels_cached(year=year, month=month)
+            if self.output_mode == "split":
+                self._precompute_split_cached(year=year, month=month)
+            else:
+                # self._precompute_all_channels()
+                self._precompute_all_channels_cached(year=year, month=month)
 
         print(f"[TIMING-Dataset] precompute_channels: {time.time()-_init_t:.2f}s")
         
@@ -318,6 +319,185 @@ class ARDatasetImproved(Dataset):
         npy_path  = os.path.join(self.TENSOR_CACHE_DIR, f"tensors_{date_str}.npy")
         meta_path = os.path.join(self.TENSOR_CACHE_DIR, f"tensors_{date_str}.meta.npy")
         return npy_path, meta_path
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Phase 1 — split contract: predictors (physics) vs labels (heuristic masks)
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _get_split_cache_path(self, year, month):
+        """Return (npy_path, meta_path) for the split-contract cache."""
+        date_str  = f"{year:04d}{month:02d}"
+        npy_path  = os.path.join(self.SPLIT_CACHE_DIR, f"split_{date_str}.npy")
+        meta_path = os.path.join(self.SPLIT_CACHE_DIR, f"split_{date_str}.meta.npy")
+        return npy_path, meta_path
+
+    def _resize_stack(self, data: np.ndarray) -> np.ndarray:
+        """Bilinear-resize a (C, H, W) stack to self.target_size (no-op if equal).
+
+        Mirrors the resize at the end of _compute_single_sample so predictors and
+        labels land on exactly the same grid as the legacy tensors.
+        """
+        if data.shape[1:] == (self.target_size[0], self.target_size[1]):
+            return np.ascontiguousarray(data, dtype=np.float32)
+        data = np.ascontiguousarray(data, dtype=np.float32)
+        try:
+            tensor = torch.from_numpy(data).unsqueeze(0)
+        except (TypeError, RuntimeError):
+            # Fallback for numpy/torch build mismatch (e.g. ROCm on Frontier)
+            tensor = torch.tensor(data, dtype=torch.float32).unsqueeze(0)
+        tensor = F.interpolate(
+            tensor, size=self.target_size, mode='bilinear', align_corners=False
+        ).squeeze(0)
+        return tensor.numpy()
+
+    def _build_predictor_stack(self, idx: int) -> np.ndarray:
+        """Stack the 6 RAW physical predictor fields for one timestep.
+
+        Values are left in physical units on purpose — the split cache stores raw
+        data so the normalisation can be changed later without a rebuild.
+        Standardisation happens in __getitem__ via self.predictor_stats.
+        """
+        fields = []
+        for name, attr in self.PREDICTOR_SPECS:
+            arr = getattr(self, attr, None)
+            if arr is None:
+                if attr == "ivt_raw":
+                    raise ValueError(
+                        "predictor 'IVT' requires self.ivt_raw, which is absent. "
+                        "Do NOT fall back to self.ivt: the preprocessed cache "
+                        "zeroed it below 400 kg/m/s, so it is effectively the AR "
+                        "label (IoU 0.917) and would re-create the Phase 0 copy "
+                        "shortcut. Supply 'ivt_raw' = sqrt(Qu^2 + Qv^2) from the "
+                        "source ERA5 file (precompute_tensors.py does this in "
+                        "--split mode)."
+                    )
+                raise ValueError(f"predictor '{name}' (self.{attr}) is missing")
+            fields.append(np.asarray(arr[idx], dtype=np.float32))
+
+        target_shape = fields[0].shape
+        cleaned = []
+        for f in fields:
+            if f.shape != target_shape:
+                f = np.broadcast_to(f, target_shape)
+            cleaned.append(np.ascontiguousarray(f, dtype=np.float32))
+        return np.stack(cleaned, axis=0)   # (6, H, W) raw
+
+    def _compute_split_sample(self, idx: int) -> np.ndarray:
+        """Build one (10, H, W) split sample: 6 raw predictors + 4 float labels.
+
+        Labels are sliced out of the legacy 14-channel computation so the science
+        criteria are bit-identical to what the model was previously trained on —
+        Phase 1 changes only WHAT THE MODEL CAN SEE, not how the masks are made.
+        They are kept as floats (not binarised) so the loss and metrics stay free
+        to choose their own threshold; ETC in particular carries a graded
+        intensity that post_processing reads at >= 0.90.
+        """
+        legacy = self._compute_single_sample(idx)          # (14, H, W), resized
+        labels = legacy[self.LEGACY_LABEL_CHANNELS]        # (4, H, W)
+        preds = self._resize_stack(self._build_predictor_stack(idx))  # (6, H, W)
+        return np.concatenate([preds, labels], axis=0)     # (10, H, W)
+
+    def _precompute_split_cached(self, year=None, month=None):
+        """Build (or load) the whole month of split samples.
+
+        Fast path   : split_{YYYYMM}.npy exists -> np.load
+        Medium path : legacy v2 tensors exist -> reuse their mask channels and
+                      only build the cheap raw-predictor stack (~seconds)
+        Slow path   : neither -> run the full ~23 min scipy mask precompute
+        """
+        t0 = _time.time()
+        expected_shape = (self.total_samples,
+                          self.N_PREDICTORS + self.N_LABELS,
+                          self.target_size[0], self.target_size[1])
+
+        # ── Fast path ────────────────────────────────────────────────────────
+        if year is not None and month is not None:
+            npy_path, _ = self._get_split_cache_path(year, month)
+            if os.path.exists(npy_path):
+                try:
+                    loaded = np.load(npy_path, mmap_mode='r')
+                    if loaded.shape == expected_shape:
+                        self.precomputed_data = np.array(loaded, dtype=np.float32)
+                        print(f"  ✅ [SPLIT CACHE HIT] {npy_path} "
+                              f"in {_time.time()-t0:.1f}s "
+                              f"({self.precomputed_data.nbytes/1024**2:.0f} MB)")
+                        return
+                    print(f"  ⚠️  Split cache shape mismatch: expected "
+                          f"{expected_shape}, got {loaded.shape}. Recomputing...")
+                except Exception as e:
+                    print(f"  ⚠️  Split cache load failed ({e}). Recomputing...")
+
+        # ── Medium path: reuse the legacy v2 tensors for the mask channels ───
+        legacy_data = None
+        if year is not None and month is not None:
+            legacy_npy, _ = self._get_tensor_cache_path(year, month)
+            if os.path.exists(legacy_npy):
+                try:
+                    cand = np.load(legacy_npy, mmap_mode='r')
+                    if cand.shape == (self.total_samples, 14,
+                                      self.target_size[0], self.target_size[1]):
+                        legacy_data = cand
+                        print(f"  ♻️  [SPLIT] reusing legacy masks from {legacy_npy} "
+                              f"— skipping the scipy precompute")
+                    else:
+                        print(f"  ⚠️  Legacy cache shape {cand.shape} unusable; "
+                              f"will recompute masks")
+                except Exception as e:
+                    print(f"  ⚠️  Legacy cache unreadable ({e}); will recompute masks")
+
+        if legacy_data is None:
+            print(f"  🔄 [SPLIT CACHE MISS] full precompute for "
+                  f"{year:04d}-{month:02d} (~23 min)...")
+            self._precompute_all_channels()          # fills self.precomputed_data (N,14,H,W)
+            legacy_data = self.precomputed_data
+
+        # ── Assemble the split tensors ───────────────────────────────────────
+        N = self.total_samples
+        out = np.zeros(expected_shape, dtype=np.float32)
+        for i in range(N):
+            preds = self._resize_stack(self._build_predictor_stack(i))
+            out[i, :self.N_PREDICTORS] = preds
+            out[i, self.N_PREDICTORS:] = np.asarray(
+                legacy_data[i][self.LEGACY_LABEL_CHANNELS], dtype=np.float32)
+        self.precomputed_data = out
+
+        print(f"  [SPLIT] built {N} samples in {_time.time()-t0:.1f}s "
+              f"({out.nbytes/1024**2:.0f} MB)")
+
+        # ── Save ─────────────────────────────────────────────────────────────
+        if year is not None and month is not None:
+            try:
+                os.makedirs(self.SPLIT_CACHE_DIR, exist_ok=True)
+                npy_path, meta_path = self._get_split_cache_path(year, month)
+                np.save(npy_path, self.precomputed_data)
+                np.save(meta_path, self.time)
+                print(f"  💾 [SPLIT CACHE SAVED] {npy_path}")
+            except Exception as e:
+                print(f"  ⚠️  Could not save split cache: {e}")
+
+    def _normalise_predictors(self, preds: np.ndarray) -> np.ndarray:
+        """Standardise the raw predictor stack in place-ish, returning a copy.
+
+        Falls back to identity (with a one-time warning) when no stats are given,
+        so a missing stats file is loud rather than silently training on
+        unnormalised MSLP in pascals.
+        """
+        if self.predictor_stats is None:
+            if not getattr(self, "_warned_no_stats", False):
+                print("  ⚠️  No predictor_stats supplied — predictors are RAW. "
+                      "Training on unstandardised fields will not converge; "
+                      "pass predictor_stats (see build_split_cache.py --stats).")
+                self._warned_no_stats = True
+            return preds
+        out = np.empty_like(preds)
+        for c, name in enumerate(self.PREDICTOR_NAMES):
+            st = self.predictor_stats.get(name)
+            if st is None:
+                out[c] = preds[c]
+                continue
+            std = float(st["std"])
+            out[c] = (preds[c] - float(st["mean"])) / (std if std > 0 else 1.0)
+        return out
 
     def _precompute_all_channels_cached(self, year=None, month=None):
         """
@@ -340,7 +520,7 @@ class ARDatasetImproved(Dataset):
                 try:
                     loaded = np.load(npy_path, mmap_mode='r')   # memory-mapped: no RAM copy
 
-                    # Validate shape matches current dataset (14 channels, MCS on)
+                    # Validate shape matches current dataset
                     expected_shape = (self.total_samples, 14,
                                     self.target_size[0], self.target_size[1])
 
@@ -402,14 +582,14 @@ class ARDatasetImproved(Dataset):
         N = self.total_samples
         H_target, W_target = self.target_size
         
-        # Allocate storage for all precomputed tensors (14 channels, MCS on)
+        # Allocate storage for all precomputed tensors
         self.precomputed_data = np.empty(
             (N, 14, H_target, W_target), dtype=np.float32
         )
-
+        
         print(f"Pre-computing 14-channel tensors for {N} samples "
             f"(target size {H_target}×{W_target})...")
-
+        
         for idx in range(N):
             try:
                 tensor = self._compute_single_sample(idx)
@@ -471,7 +651,6 @@ class ARDatasetImproved(Dataset):
         else:
             etc_lat_mask_2d = self.etc_lat_mask.astype(np.float32)
         
-        # ── MCS re-enabled (RegCM BT now available) ────────────────────────────
         mcs_lat_mask_2d = np.zeros((height, width), dtype=np.float32)
         if len(self.mcs_lat_mask.shape) == 1:
             for i in range(min(height, len(self.mcs_lat_mask))):
@@ -479,7 +658,7 @@ class ARDatasetImproved(Dataset):
                     mcs_lat_mask_2d[i, :] = 1.0
         else:
             mcs_lat_mask_2d = self.mcs_lat_mask.astype(np.float32)
-
+        
         # Storm masks
         hurricane_masks = self._create_hurricane_masks(idx, hurricane_lat_mask_2d)
         etc_masks = self._create_etc_masks(idx, etc_lat_mask_2d)
@@ -784,7 +963,7 @@ class ARDatasetImproved(Dataset):
 
         # Boundary threshold (241K)
         if self.bt_boundary_threshold is not None:
-            print(f"✓ Using global boundary brightness temperature threshold: {_fmt_thr(self.bt_boundary_threshold)}")
+            print(f"✓ Using global boundary brightness temperature threshold: {self.bt_boundary_threshold:.2f} K")
             self.bt_boundary_threshold_local = None
         else:
             self.bt_boundary_threshold_local = 241.0  # Fixed meteorological threshold
@@ -792,7 +971,7 @@ class ARDatasetImproved(Dataset):
 
         # Core threshold (225K)
         if self.bt_core_threshold is not None:
-            print(f"✓ Using global core brightness temperature threshold: {_fmt_thr(self.bt_core_threshold)}")
+            print(f"✓ Using global core brightness temperature threshold: {self.bt_core_threshold:.2f} K")
             self.bt_core_threshold_local = None
         else:
             self.bt_core_threshold_local = 225.0  # Fixed meteorological threshold
@@ -846,12 +1025,12 @@ class ARDatasetImproved(Dataset):
         #     print(f"  Total Precipitation Rate: LOCAL FIXED ({self.tpr_heavy_threshold:.4f} mm/h)")
 
         if self.bt_boundary_threshold is not None:
-            print(f"  Brightness Temperature (Boundary): {_fmt_thr(self.bt_boundary_threshold)}")
+            print(f"  Brightness Temperature (Boundary): GLOBAL SCALAR ({self.bt_boundary_threshold:.2f} K)")
         else:
             print(f"  Brightness Temperature (Boundary): LITERATURE FIXED ({self.bt_boundary_threshold_local:.1f} K)")
 
         if self.bt_core_threshold is not None:
-            print(f"  Brightness Temperature (Core): {_fmt_thr(self.bt_core_threshold)}")
+            print(f"  Brightness Temperature (Core): GLOBAL SCALAR ({self.bt_core_threshold:.2f} K)")
         else:
             print(f"  Brightness Temperature (Core): LITERATURE FIXED ({self.bt_core_threshold_local:.1f} K)")
         
@@ -974,6 +1153,8 @@ class ARDatasetImproved(Dataset):
         filter_center_km: float       = 400.0,
         max_wind_threshold: float     = 8.0,       # m/s — CyTRACK Condition iv
         radius_msw_km: float          = 100.0,     # km — CyTRACK radius_for_msw
+        equatorial_vor_scale: float   = 0.5,       # 1.0 = no equatorial relaxation
+        require_both: bool            = False,     # True = iv AND v, not iv OR v
     ) -> np.ndarray:
         """
         CyTRACK-style TC centre detection.
@@ -1031,7 +1212,10 @@ class ARDatasetImproved(Dataset):
         vor_thresh = self.vor850_hurricane_threshold if self.vor850_hurricane_threshold is not None \
                     else vorticity_threshold
         equatorial_band = np.abs(lat_2d) < 10.0
-        vor_thresh_2d = np.where(equatorial_band, vor_thresh * 0.5, vor_thresh)
+        # equatorial_vor_scale relaxes the vorticity floor near the equator, where
+        # Coriolis is weak. 1.0 removes the relaxation; it is a screening knob.
+        vor_thresh_2d = np.where(equatorial_band, vor_thresh * equatorial_vor_scale,
+                                 vor_thresh)
         nh_vor = (lat_2d >= 0) & (vor_field >=  vor_thresh_2d)
         sh_vor = (lat_2d <  0) & (vor_field <= -vor_thresh_2d)
         cond_v = nh_vor | sh_vor
@@ -1052,7 +1236,11 @@ class ARDatasetImproved(Dataset):
                 continue
             has_wind = local_wind_max[r, c] >= max_wind_threshold   # iv
             has_vor  = cond_v[r, c]                                 # v
-            if not (has_wind or has_vor):                    # need at least one
+            # require_both=True restores the strict CyTRACK reading (iv AND v).
+            # The default OR was relaxed for landfalling storms that lose vorticity
+            # to surface friction while keeping wind, or vice versa.
+            ok = (has_wind and has_vor) if require_both else (has_wind or has_vor)
+            if not ok:
                 continue
             valid[r, c] = 1.0
 
@@ -1142,6 +1330,14 @@ class ARDatasetImproved(Dataset):
                 filter_center_km       = 400.0,
                 max_wind_threshold     = 8.0,        # CyTRACK paper value
                 radius_msw_km          = 150.0,      # wider search for asymmetric landfalling winds
+                # Conditions iv AND v, not iv OR v. The OR was relaxed for
+                # landfalling storms that lose vorticity to surface friction while
+                # keeping wind. Tier B screening (phase4_tc_label_screen.py) over
+                # 2003+2012, 2924 steps, physics only, measured that relaxation at
+                # 105,604 extra false objects for 2 extra storms out of 3,271:
+                # POD 0.888 -> 0.887, FAR 0.986 -> 0.973, CSI 0.014 -> 0.027,
+                # detections 72.2 -> 36.1 per step against ~2.3 real storms.
+                require_both           = True,
             )        
 
         # ── Dilate centres → regional influence mask ──────────────────────────────
@@ -1443,44 +1639,6 @@ class ARDatasetImproved(Dataset):
         core_mask   = (bt_field   <= core_threshold) & \
                     (bt_anomaly <= anomaly_core_threshold)
 
-        return self._blobs_from_shield_core(
-            shield_mask, core_mask, bt_field,
-            min_core_pixels=min_core_pixels,
-            min_blob_area=min_blob_area,
-            min_enclosure_distance=min_enclosure_distance,
-        )
-
-    def _blobs_from_shield_core(
-        self,
-        shield_mask: np.ndarray,
-        core_mask: np.ndarray,
-        intensity_field: np.ndarray,
-        min_core_pixels: int = 3,
-        min_blob_area: int = 50,
-        min_enclosure_distance: int = 2,
-    ) -> Tuple[np.ndarray, Dict]:
-        """
-        Shield/core blob assembly — shared by the BT and precipitation branches.
-
-        Everything here is threshold-agnostic: it takes two boolean masks and
-        knows nothing about what field produced them or which sign convention
-        was used ("cold = event" for BT, "wet = event" for precip). Only the
-        mask construction differs between branches, so only that is duplicated.
-
-        Steps:
-          2. label both masks (8-connected)
-          3. match each core blob → its best-overlapping shield blob
-          4-6. per shield: reject if smaller than `min_blob_area`; reject cores
-               smaller than `min_core_pixels` or sitting on the shield edge
-               (`min_enclosure_distance` via EDT); Voronoi-split multi-core
-               shields and re-check each piece.
-
-        `intensity_field` is only used for the per-system diagnostics.
-        """
-        from scipy.ndimage import label, distance_transform_edt
-
-        conn8 = np.ones((3, 3), dtype=np.int32)
-
         # ------------------------------------------------------------------
         # STEP 2 – label connected components
         # ------------------------------------------------------------------
@@ -1488,7 +1646,7 @@ class ARDatasetImproved(Dataset):
         labeled_core,   num_cores  = label(core_mask.astype(np.int32),   structure=conn8)
 
         if num_shield == 0 or num_cores == 0:
-            return np.zeros_like(intensity_field, dtype=np.float32), {}
+            return np.zeros_like(bt_field, dtype=np.float32), {}
 
         # ------------------------------------------------------------------
         # STEP 3 – match each C-blob → best-overlapping S-blob
@@ -1512,7 +1670,7 @@ class ARDatasetImproved(Dataset):
             core_to_shield = {c: v[0] for c, v in best.items()}
 
         if not core_to_shield:
-            return np.zeros_like(intensity_field, dtype=np.float32), {}
+            return np.zeros_like(bt_field, dtype=np.float32), {}
 
         shield_to_cores: Dict[int, list] = {}
         for c_id, s_id in core_to_shield.items():
@@ -1521,7 +1679,7 @@ class ARDatasetImproved(Dataset):
         # ------------------------------------------------------------------
         # STEPS 4 + 5 + 6 – validate, filter, split
         # ------------------------------------------------------------------
-        valid_blob_mask = np.zeros_like(intensity_field, dtype=np.float32)
+        valid_blob_mask = np.zeros_like(bt_field, dtype=np.float32)
         blob_properties: Dict[int, dict] = {}
         system_id = 0
 
@@ -1561,7 +1719,7 @@ class ARDatasetImproved(Dataset):
                     shield_mask=shield_blob_mask,
                     core_mask=valid_cores[0][1],
                     core_area=valid_cores[0][2],
-                    intensity_field=intensity_field,
+                    bt_field=bt_field,
                     valid_blob_mask=valid_blob_mask,
                     blob_properties=blob_properties,
                     num_original_cores=1,
@@ -1602,7 +1760,7 @@ class ARDatasetImproved(Dataset):
                         shield_mask=sub_shield_mask,
                         core_mask=c_blob_mask,
                         core_area=core_area,
-                        intensity_field=intensity_field,
+                        bt_field=bt_field,
                         valid_blob_mask=valid_blob_mask,
                         blob_properties=blob_properties,
                         num_original_cores=len(valid_cores),
@@ -1610,99 +1768,25 @@ class ARDatasetImproved(Dataset):
 
         return valid_blob_mask, blob_properties
 
-    @staticmethod
-    def _convective_fraction(prc_field: np.ndarray, pr_field: np.ndarray) -> np.ndarray:
-        """Convective share of total precipitation, in [0, 1].
-
-        Zero where it is essentially not raining, so that dividing noise by noise
-        cannot manufacture a "fully convective" dry pixel. Clipped because pr and
-        prc are remapped independently and rounding can put prc a hair above pr.
-        """
-        cf = np.where(pr_field > 1e-3,
-                      prc_field / np.maximum(pr_field, 1e-6),
-                      0.0)
-        return np.clip(cf, 0.0, 1.0).astype(np.float32)
-
-    def _detect_mcs_blobs_precip(
-        self,
-        prc_field: np.ndarray,          # convective precip, mm/h
-        pr_field: np.ndarray,           # total precip, mm/h
-        shield_threshold: float,        # e.g. 0.1 mm/h  (scalar or 2-D)
-        core_threshold: float,          # e.g. 1.0 mm/h  (scalar or 2-D)
-        convfrac_threshold: float,      # e.g. 0.7       (scalar or 2-D)
-        min_core_pixels: int = 3,
-        min_blob_area: int = 50,
-        min_enclosure_distance: int = 2,
-    ) -> Tuple[np.ndarray, Dict, np.ndarray]:
-        """
-        Detect MCS blobs from convective precipitation.
-
-        The precipitation analogue of `_detect_mcs_blobs`, with the comparisons
-        inverted (`>=` — wet is the event, where for BT cold was the event):
-
-            shield: prc >= shield_threshold AND convective fraction >= convfrac_threshold
-            core:   prc >= core_threshold
-
-        Two deliberate differences from the BT version:
-
-        * **No local-anomaly filter.** BT needed one (`bt_anomaly <= -8/-15 K`) to
-          kill large uniform cold sheets, because BT has no natural floor and a
-          big slowly-varying background. Precipitation's background is ~0 over
-          most of the domain, so a uniform_filter background is ~0 and the
-          anomaly degenerates to a rescaled copy of the field itself — the test
-          would add nothing while costing a 31x31 convolution per timestep.
-
-        * **A convective-fraction gate instead.** This is the load-bearing part:
-          it is what makes this an MCS detector rather than a rain detector.
-          RegCM's PNW winter rain is stratiform orographic upslope (convective
-          fraction ~40-48%) while Great Plains summer convection is ~91-97%, so
-          the gate separates the two on physics rather than on geography. It is
-          exactly the discriminator the cloud-top proxy cannot express.
-
-        The gate is applied to the shield only — a cell already raining at
-        >= 1 mm/h of *convective* precip is convective by construction, so
-        gating the core too would be redundant and would only cost recall.
-
-        Returns (valid_blob_mask, blob_properties, convective_fraction); the
-        caller reuses the fraction for the boundary-only channel.
-        """
-        convfrac = self._convective_fraction(prc_field, pr_field)
-
-        shield_mask = (prc_field >= shield_threshold) & (convfrac >= convfrac_threshold)
-        core_mask   = (prc_field >= core_threshold)
-
-        blob_mask, blob_properties = self._blobs_from_shield_core(
-            shield_mask, core_mask, prc_field,
-            min_core_pixels=min_core_pixels,
-            min_blob_area=min_blob_area,
-            min_enclosure_distance=min_enclosure_distance,
-        )
-        return blob_mask, blob_properties, convfrac
-
     def _accept_system(
         self,
         system_id: int,
         shield_mask: np.ndarray,
         core_mask: np.ndarray,
         core_area: int,
-        intensity_field: np.ndarray,
+        bt_field: np.ndarray,
         valid_blob_mask: np.ndarray,
         blob_properties: dict,
         num_original_cores: int,
     ) -> None:
-        """Record one accepted system. `intensity_field` is BT (K) for the legacy
-        branch and convective precip (mm/h) for the precip branch — so the stats
-        are named neutrally rather than as temperatures. These diagnostics are
-        currently discarded by _create_mcs_masks; they exist for debugging."""
         valid_blob_mask[shield_mask] = 1.0
         shield_area = int(shield_mask.sum())
-        vals        = intensity_field[shield_mask]
+        bt_vals     = bt_field[shield_mask]
         blob_properties[system_id] = {
             'shield_area'   : shield_area,
             'core_area'     : core_area,
-            'min_value'     : float(vals.min()),
-            'max_value'     : float(vals.max()),
-            'mean_value'    : float(vals.mean()),
+            'min_temp'      : float(bt_vals.min()),
+            'mean_temp'     : float(bt_vals.mean()),
             'num_cores'     : num_original_cores,
             'core_fraction' : core_area / shield_area if shield_area > 0 else 0.0,
         }
@@ -1833,9 +1917,6 @@ class ARDatasetImproved(Dataset):
                 'min_core_pixels': 3,         # Compact intense cores
                 'bt_boundary': 241.0,         # Standard boundary
                 'bt_core': 223.0,             # STRICTER core (was 225K)
-                'pr_shield': 0.1,             # mm/h convective (precip branch)
-                'pr_core': 1.0,               # mm/h convective — standard core rate
-                'pr_convfrac': 0.7,           # prc/pr — separates convection from upslope
                 'moisture_threshold': 0.5,    # legacy absolute gate
                 'moisture_anom_threshold': 2.0,   # require above-normal moisture in summer
                 'shear_threshold': 0.6,       # Favorable shear needed
@@ -1848,13 +1929,6 @@ class ARDatasetImproved(Dataset):
                 'min_core_pixels': 8,         # Larger cores
                 'bt_boundary': 241.0,         # Standard boundary
                 'bt_core': 228.0,             # RELAXED core (was 225K)
-                'pr_shield': 0.1,             # mm/h convective (precip branch)
-                # NOT relaxed (cf. bt_core 223→228 in winter). Cold-season MCS do
-                # have weaker updrafts, so a relaxation to ~0.5 is plausible — but
-                # the validated diagnostic used 1.0 in every season, so keep 1.0
-                # here and test any relaxation as an isolated, measured delta.
-                'pr_core': 1.0,
-                'pr_convfrac': 0.7,
                 'moisture_threshold': 0.3,    # legacy absolute gate
                 'moisture_anom_threshold': -2.0,  # allow near/slightly-below-normal (cold, dry season)
                 'shear_threshold': 0.4,       # More lenient shear
@@ -1867,9 +1941,6 @@ class ARDatasetImproved(Dataset):
                 'min_core_pixels': 5,         # Medium cores
                 'bt_boundary': 241.0,         # Standard boundary
                 'bt_core': 225.0,             # Standard core
-                'pr_shield': 0.1,             # mm/h convective (precip branch)
-                'pr_core': 1.0,               # mm/h convective
-                'pr_convfrac': 0.7,
                 'moisture_threshold': 0.4,    # legacy absolute gate
                 'moisture_anom_threshold': 0.0,   # above-normal moisture
                 'shear_threshold': 0.5,       # Moderate shear
@@ -1881,31 +1952,22 @@ class ARDatasetImproved(Dataset):
     def _create_mcs_masks(self, idx: int, lat_mask_2d: np.ndarray) -> Dict[str, np.ndarray]:
         """
         Create MCS detection masks with SEASONAL ADAPTIVITY.
-
-        Two sources, selected by `self.mcs_source`:
-          "precip" (default) — convective-precip shield/core. RegCM's own
-              convection scheme is the MCS proxy; seasonality is correct
-              (Great Plains DJF ~0.2 vs JJA ~12.3 MCS days).
-          "bt" (legacy)      — cloud-top-temperature proxy, kept for A/B only.
-              Its Great Plains cold signal is winter frontal cirrus and bottoms
-              out in July, i.e. anti-correlated with the MCS season.
-
-        Returns the same three keys either way — 'mcs_boundary' / 'mcs_blobs' /
-        'mcs_core' → input channels 11 / 12 / 13 — so nothing downstream
-        (the channel stack, loss.py) changes with the source.
-
+        
+        Summer: Smaller, more intense systems (strict thresholds)
+        Winter: Larger, organized systems (relaxed thresholds)
+        
         Method:
         1. Determine season and get adaptive parameters
         2. Boundary/core thresholds adapt to season
         3. Size requirements vary by season
         4. Moisture and shear requirements adjust
         """
-
+        
         # ============================
         # 1. GET SEASONAL PARAMETERS
         # ============================
         seasonal_params = self._get_seasonal_mcs_parameters(idx)
-
+        
         # Extract seasonal thresholds
         bt_boundary_seasonal = seasonal_params['bt_boundary']
         bt_core_seasonal = seasonal_params['bt_core']
@@ -1913,50 +1975,29 @@ class ARDatasetImproved(Dataset):
         min_core_pixels_seasonal = seasonal_params['min_core_pixels']
         moisture_thresh_seasonal = seasonal_params['moisture_threshold']
         shear_thresh_seasonal = seasonal_params['shear_threshold']
-
+        
         # Override with global thresholds if provided (boundary/core only)
         if self.bt_boundary_threshold is not None:
             bt_boundary = self.bt_boundary_threshold
         else:
             bt_boundary = bt_boundary_seasonal
-
+        
         if self.bt_core_threshold is not None:
             bt_core = self.bt_core_threshold
         else:
             bt_core = bt_core_seasonal
-
-        # Precip thresholds: global override (utils.load_regcm_pr_thresholds) wins,
-        # else the seasonal defaults. Same precedence as BT above.
-        pr_shield = (self.pr_shield_threshold if self.pr_shield_threshold is not None
-                     else seasonal_params['pr_shield'])
-        pr_core = (self.pr_core_threshold if self.pr_core_threshold is not None
-                   else seasonal_params['pr_core'])
-        pr_convfrac = (self.pr_convfrac_threshold if self.pr_convfrac_threshold is not None
-                       else seasonal_params['pr_convfrac'])
-
+        
         # ============================
         # 2. SEASONAL BLOB DETECTION
         # ============================
-        convfrac = None
-        if self.mcs_source == "precip":
-            mcs_blob_mask, blob_properties, convfrac = self._detect_mcs_blobs_precip(
-                self.prc[idx],
-                self.pr[idx],
-                shield_threshold=pr_shield,
-                core_threshold=pr_core,
-                convfrac_threshold=pr_convfrac,
-                min_core_pixels=min_core_pixels_seasonal,  # SEASONAL
-                min_blob_area=min_blob_area_seasonal       # SEASONAL
-            )
-        else:
-            mcs_blob_mask, blob_properties = self._detect_mcs_blobs(
-                self.bt_ds[idx],
-                boundary_threshold=bt_boundary,
-                core_threshold=bt_core,
-                min_core_pixels=min_core_pixels_seasonal,  # SEASONAL
-                min_blob_area=min_blob_area_seasonal       # SEASONAL
-            )
-
+        mcs_blob_mask, blob_properties = self._detect_mcs_blobs(
+            self.bt_ds[idx], 
+            boundary_threshold=bt_boundary,
+            core_threshold=bt_core,
+            min_core_pixels=min_core_pixels_seasonal,  # SEASONAL
+            min_blob_area=min_blob_area_seasonal       # SEASONAL
+        )
+        
         # ============================
         # 3. MOISTURE ASSESSMENT
         # ============================
@@ -2016,54 +2057,35 @@ class ARDatasetImproved(Dataset):
         # ============================
         # 6. SEASONALLY-ADAPTIVE CORE MCS MASK
         # ============================
-        if self.mcs_source == "precip":
-            # NO IWV gate here, deliberately.
-            #
-            # `blobs * moisture` made sense for BT: a cold cloud top is not proof
-            # of rain, so the IWV anomaly supplied the missing moisture evidence.
-            # A precip blob needs no such inference — it ALREADY RAINED, which is
-            # strictly stronger evidence than an IWV anomaly.
-            #
-            # Re-adding the gate would also re-import the cool-season suppression
-            # that the winter `moisture_anom_threshold = -2.0` hack exists to work
-            # around, and would corrupt the summer-peaked seasonality that is the
-            # entire point of the precip branch.
-            mcs_core_mask = mcs_blob_mask.astype(np.float32)
-        else:
-            # Use seasonal thresholds for primary detection
-            mcs_core_seasonal = (
-                mcs_blob_mask *
-                mcs_seasonal_moisture
-                # *
-                # mcs_seasonal_shear
-            ).astype(np.float32)
-
-            # MODERATE: Fixed moderate criteria (for comparison)
-            mcs_core_moderate = (
-                mcs_blob_mask *
-                mcs_marginal_moisture
-            ).astype(np.float32)
-
-            # FINAL CORE: Use seasonal adaptive mask
-            mcs_core_mask = mcs_core_seasonal
-
-
+        # Use seasonal thresholds for primary detection
+        mcs_core_seasonal = (
+            mcs_blob_mask * 
+            mcs_seasonal_moisture 
+            # *
+            # mcs_seasonal_shear
+        ).astype(np.float32)
+        
+        # MODERATE: Fixed moderate criteria (for comparison)
+        mcs_core_moderate = (
+            mcs_blob_mask * 
+            mcs_marginal_moisture
+        ).astype(np.float32)
+        
+        # FINAL CORE: Use seasonal adaptive mask
+        mcs_core_mask = mcs_core_seasonal
+        
+        
         # ============================
         # 7. BOUNDARY-ONLY MASK
         # ============================
-        # Threshold-only shield: no size or enclosure test, so it is always a
-        # superset of mcs_blobs.
-        if self.mcs_source == "precip":
-            mcs_boundary_only = ((self.prc[idx] >= pr_shield) &
-                                 (convfrac >= pr_convfrac)).astype(np.float32)
-        else:
-            mcs_boundary_only = (self.bt_ds[idx] <= bt_boundary).astype(np.float32)
+        mcs_boundary_only = (self.bt_ds[idx] <= bt_boundary).astype(np.float32)
         mcs_boundary_only *= lat_mask_2d
-
+        
         return {
-            'mcs_boundary': mcs_boundary_only,        # Threshold-only shield
+            'mcs_boundary': mcs_boundary_only,        # Boundary threshold only
             'mcs_blobs': mcs_blob_mask,               # Seasonally-sized blobs
-            'mcs_core': mcs_core_mask,                # Training target (channel 13)
+            'mcs_core': mcs_core_mask,                # Seasonal adaptive detection (blob + moisture)
+            # 'mcs_core_moderate': mcs_core_moderate,   # Fixed moderate (for comparison)
             # 'season': seasonal_params['season'],      # Season label (for debugging)
         }
 
@@ -2128,17 +2150,50 @@ class ARDatasetImproved(Dataset):
     def __len__(self) -> int:
         return self.total_samples
     
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
+        data = np.ascontiguousarray(data, dtype=np.float32)
+        try:
+            return torch.from_numpy(data).to(dtype=self.dtype)
+        except (TypeError, RuntimeError):
+            # Fallback for numpy/torch build mismatch (e.g. ROCm on Frontier)
+            return torch.tensor(data, dtype=self.dtype)
+
+    def _getitem_split(self, idx: int):
+        """Split contract: (predictors (6,H,W) standardised, labels (4,H,W)).
+
+        The model never sees the labels. That is the whole point of Phase 1 —
+        the copy shortcut the Phase 0 ablation measured becomes impossible to
+        express, not merely unrewarded.
+        """
+        if hasattr(self, 'precomputed_data') and self.precomputed_data is not None:
+            sample = self.precomputed_data[idx]
+        else:
+            sample = self._compute_split_sample(idx)
+
+        preds = np.asarray(sample[:self.N_PREDICTORS], dtype=np.float32)
+        labels = np.asarray(sample[self.N_PREDICTORS:], dtype=np.float32)
+        return self._to_tensor(self._normalise_predictors(preds)), self._to_tensor(labels)
+
+    def __getitem__(self, idx: int):
         """
         Get a precomputed sample. All expensive scipy/numpy mask computations
         were done once during __init__ by _precompute_all_channels().
-        
+
         Args:
             idx: Sample index
-            
+
         Returns:
-            Tensor with shape (14, height, width)
+            output_mode="legacy" : Tensor (14, height, width)
+            output_mode="split"  : (predictors (6,H,W), labels (4,H,W))
         """
+        if self.output_mode == "split":
+            try:
+                return self._getitem_split(idx)
+            except Exception as e:
+                print(f"Error processing split sample {idx}: {e}")
+                return (torch.zeros(self.N_PREDICTORS, *self.target_size, dtype=self.dtype),
+                        torch.zeros(self.N_LABELS, *self.target_size, dtype=self.dtype))
+
         try:
             # Fast path: return precomputed data (zero CPU overhead)
             if hasattr(self, 'precomputed_data') and self.precomputed_data is not None:
@@ -2211,7 +2266,7 @@ def preprocess_data_improved(ivt: xr.DataArray,
                            windhshear_ds: Optional[xr.DataArray] = None,
                         #    SST_ds: Optional[xr.DataArray] = None,
                            BT_ds: Optional[xr.DataArray] = None,
-                           PR_ds: Optional[xr.Dataset] = None,
+                        #    TPR: Optional[xr.DataArray] = None,
                            IWV: Optional[xr.DataArray] = None,
                            km_per_pixel: float = 1.0) -> xr.Dataset:
 
@@ -2228,9 +2283,8 @@ def preprocess_data_improved(ivt: xr.DataArray,
         temp_500mb: warmcore t300-t500 temperature data
         windhshear_ds: windshear magnitude data 
         # SST_ds: SST data 
-        BT_ds: Brightness Temp data
-        PR_ds: Precipitation dataset with `pr` (total) and `prc` (convective),
-               both in mm/h — the source for the MCS branch
+        BT_ds: Brightness Temp data 
+        TPR: Total Precipitation rate data 
         IWV: Integrated Water Vapor data
         vorticity_threshold: Vorticity threshold
         
@@ -2358,105 +2412,16 @@ def preprocess_data_improved(ivt: xr.DataArray,
         
         # Clean coordinates first
         BT_ds = clean_coordinates(BT_ds)
-        # Align BT to the main IVT time axis. RegCM BT is stored in yearly files;
-        # the per-month slice does NOT match the WNet month grid exactly (differing
-        # count — e.g. Jan 121 vs 120 — and a 6 h offset). Nearest-time selection
-        # yields exactly one BT scene per main timestep so the positional index
-        # self.bt_ds[idx] stays aligned with ivt/mslp/etc.
-        try:
-            if 'time' in getattr(BT_ds, 'coords', {}) and 'time' in ivt.coords:
-                _main_t = ivt['time'].values
-                # sel(...nearest) keeps BT's original timestamps (which can repeat
-                # → duplicate index → merge fails), so relabel to the main axis.
-                BT_ds = (BT_ds.sel(time=_main_t, method='nearest')
-                              .assign_coords(time=_main_t))
-        except Exception as e:
-            print(f"BT time-alignment skipped: {e}")
-        # RegCM BT is a "diagnosed cloud-top temperature proxy" that is NaN over
-        # clear sky (no cloud top → ~45% of pixels). The downstream
-        # nan_to_num(nan=0) would turn clear sky into 0 K — colder than the 225 K
-        # MCS core threshold — flagging the whole clear-sky domain as deep
-        # convection. Fill clear sky with a warm constant well above the 241/225 K
-        # thresholds so it is never counted as an MCS. (ERA5 BT had no NaNs.)
-        BT_CLEARSKY_FILL_K = 290.0
-        BT_ds = BT_ds.fillna(BT_CLEARSKY_FILL_K)
         try:
             bt_min = float(BT_ds.min().values)
             bt_max = float(BT_ds.max().values)
-            print(f"BT processed - range: {bt_min:.2f} to {bt_max:.2f} K "
-                  f"(clear-sky NaN → {BT_CLEARSKY_FILL_K:.0f} K)")
+            print(f"BT processed - range: {bt_min:.2f} to {bt_max:.2f} K")
         except Exception as e:
             print(f"BT processed (could not compute range: {str(e)})")
     else:
         print("Missing BT data...")
 
-    # ── Precipitation (pr / prc, mm/h) — the MCS source ───────────────────────
-    # Mirrors the BT block above: same time-alignment idiom, but the clear-sky
-    # fill inverts. BT needed a WARM fill (290 K) because NaN→0 would look like
-    # deep convection; precipitation's "nothing happening" value IS 0.0, which is
-    # already below every shield threshold, so NaN→0 is the safe direction.
-    pr = prc = None
-    if PR_ds is not None:
-        print("Processing precipitation data (pr, prc)...")
-
-        def _extract_precip(src, names):
-            for n in names:
-                if hasattr(src, 'data_vars') and n in src:
-                    return src[n]
-            if hasattr(src, 'data_vars'):
-                return src[list(src.data_vars)[0]]
-            return src
-
-        pr  = clean_coordinates(_extract_precip(PR_ds, ['pr', 'PR']))
-        prc = clean_coordinates(_extract_precip(PR_ds, ['prc', 'PRC']))
-
-        # Align to the main IVT time axis, exactly as BT does. The regrid step
-        # already relabels precip to the right edge of its time_bnds (06:00/12:00
-        # /...), so this should be an exact match; nearest + relabel keeps it
-        # robust and prevents duplicate timestamps from breaking the merge.
-        try:
-            if 'time' in ivt.coords:
-                _main_t = ivt['time'].values
-                for _name, _da in (('pr', pr), ('prc', prc)):
-                    if _da is not None and 'time' in getattr(_da, 'coords', {}):
-                        _aligned = (_da.sel(time=_main_t, method='nearest')
-                                       .assign_coords(time=_main_t))
-                        if _name == 'pr':
-                            pr = _aligned
-                        else:
-                            prc = _aligned
-        except Exception as e:
-            print(f"Precip time-alignment skipped: {e}")
-
-        pr  = pr.fillna(0.0)
-        prc = prc.fillna(0.0)
-
-        # Runtime tripwire for a units regression. Bounds are deliberately WIDE:
-        # this is a last-resort backstop, and the real structural check lives in
-        # verify_pr_regrid.py (regridded-vs-native max ratio, which catches a
-        # *_6hourly-sum leak as ~2.0 and a missing x3600 as ~1/3600).
-        #   < 0.5   -> the x3600 in Run_PR_regrid.sh was skipped (still kg m-2 s-1)
-        #   > 250   -> a *_6hourly-sum file leaked in (it is exactly 2x the rate)
-        # 100 mm/h was too tight and cried wolf: single-cell 6-h means of
-        # 100-155 mm/h are real convective extremes here (CNR 1992 peaks at 152.8
-        # mm/h natively, regridded to 140.8 — ratio 0.921, i.e. correctly sourced
-        # and bilinearly smoothed, not a leak).
-        try:
-            pr_max, prc_max = float(pr.max().values), float(prc.max().values)
-            print(f"Precip processed - pr max {pr_max:.2f} mm/h, "
-                  f"prc max {prc_max:.2f} mm/h")
-            if pr_max < 0.5:
-                print(f"  ⚠ pr max {pr_max:.3e} is suspiciously small — "
-                      f"is it still kg m-2 s-1? (expected mm/h)")
-            if pr_max > 250.0:
-                print(f"  ⚠ pr max {pr_max:.1f} mm/h exceeds any physical 6-h mean — "
-                      f"did a *_6hourly-sum file leak in?")
-        except Exception as e:
-            print(f"Precip processed (could not compute range: {str(e)})")
-    else:
-        print("Missing precipitation data — MCS channels will be empty!")
-
-
+        
     # Process 500mb temperature data
     if temp_500mb is not None:
         print("Processing 500mb temperature data...")
@@ -2542,7 +2507,14 @@ def preprocess_data_improved(ivt: xr.DataArray,
     # Clean coordinates for all variables
     ivt_enhanced = clean_coordinates(ivt_enhanced)
     mslp = clean_coordinates(mslp)
-
+    # TPR = clean_coordinates(TPR)
+    # try:
+    #     tpr_min = float(TPR.min().values)
+    #     tpr_max = float(TPR.max().values)
+    #     print(f"TPR processed - range: {tpr_min:.2f} to {tpr_max:.2f} kg m⁻² h⁻¹")
+    # except Exception as e:
+    #     print(f"TPR processed (could not compute range: {str(e)})")
+    
     IWV = clean_coordinates(IWV)
     try:
         iwv_min = float(IWV.min().values)
@@ -2560,9 +2532,10 @@ def preprocess_data_improved(ivt: xr.DataArray,
         'ivt_grad': ivt_grad.astype(np.float32),
         'vorticity': vorticity.astype(np.float32),
         'vorticity_grad': vorticity_grad.astype(np.float32),
+        # 'TPR': TPR.astype(np.float32),
         'IWV': IWV.astype(np.float32),
     }
-
+    
     # Add optional variables only if they are not None
     if wind_speed is not None:
         dataset_dict['wind_speed'] = wind_speed.astype(np.float32)
@@ -2572,10 +2545,6 @@ def preprocess_data_improved(ivt: xr.DataArray,
         dataset_dict['windhshear'] = windhshear_ds.astype(np.float32)
     if BT_ds is not None:
         dataset_dict['BT_ds'] = BT_ds.astype(np.float32)
-    if pr is not None:
-        dataset_dict['PR'] = pr.astype(np.float32)
-    if prc is not None:
-        dataset_dict['PRC'] = prc.astype(np.float32)
     
     combined_ds = xr.Dataset(dataset_dict)
     
@@ -2585,3 +2554,130 @@ def preprocess_data_improved(ivt: xr.DataArray,
     
     return combined_ds
 
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 2 — direct split-cache dataset
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SplitCacheDataset(Dataset):
+    """Reads tensor_cache_v3_split months directly, with global shuffling.
+
+    The split cache is self-contained — 6 raw predictors + 4 labels, already on
+    the model grid — so training needs no ERA5, IBTrACS, percentile or
+    climatology loading at all. That removes essentially all of the per-month
+    setup cost and, more importantly, lets one Dataset span MANY months.
+
+    Why that matters: the legacy loop trained on one monthly file at a time
+    (main.py -> train_wnet_improved per file), so the model saw January, then
+    February, and so on. Each file is a few hundred steps of a single month's
+    weather, which is textbook catastrophic forgetting — and it makes the loss
+    curve a record of which month is currently loaded rather than of learning.
+    Indexing every (month, timestep) pair up front and letting the sampler
+    shuffle across all of them fixes that without any extra machinery.
+
+    Months are memory-mapped, so the 179 GB cache is never resident; only the
+    touched samples are paged in.
+
+    Args:
+        files            : list of split_YYYYMM.npy paths
+        predictor_stats  : {name: {mean, std}} from compute_predictor_stats.py
+        target_threshold : if not None, labels are binarised at this value
+    """
+
+    def __init__(self, files, predictor_stats=None, target_threshold=None,
+                 dtype=torch.float32, stride=1, crop_rows=None):
+        super().__init__()
+        self.files = list(files)
+        self.dtype = dtype
+        self.target_threshold = target_threshold
+        self.stride = max(1, int(stride))
+        # Keep only the first crop_rows latitude rows. The 0.25 deg cache has 721 rows (90..-90)
+        # and the U-Net needs a multiple of 8, so crop_rows=720 drops the -90 row.
+        self.crop_rows = crop_rows
+        self._maps = {}          # lazily opened per worker process
+
+        n_pred = ARDatasetImproved.N_PREDICTORS
+        names = ARDatasetImproved.PREDICTOR_NAMES
+        if predictor_stats is None:
+            self.centre = np.zeros(n_pred, dtype=np.float32)
+            self.scale = np.ones(n_pred, dtype=np.float32)
+            print("  ⚠️  SplitCacheDataset: no predictor_stats — predictors are RAW. "
+                  "Training will not converge; run compute_predictor_stats.py.")
+        else:
+            self.centre = np.array([predictor_stats[n]["mean"] for n in names],
+                                   dtype=np.float32)
+            self.scale = np.array([predictor_stats[n]["std"] for n in names],
+                                  dtype=np.float32)
+            self.scale[self.scale <= 0] = 1.0
+
+        # (file_idx, timestep) index over every month
+        self.index = []
+        self.months = []
+        for fi, f in enumerate(self.files):
+            a = np.load(f, mmap_mode="r")
+            expect_c = n_pred + ARDatasetImproved.N_LABELS
+            if a.ndim != 4 or a.shape[1] != expect_c:
+                print(f"  ⚠️  skipping {os.path.basename(f)}: shape {a.shape}")
+                continue
+            self.months.append(f)
+            # stride>1 subsamples timesteps. Near-lossless for validation:
+            # consecutive 6-hourly frames are near-duplicates, so every 4th step
+            # covers the same weather at a quarter of the cost. In the first
+            # Phase 2 smoke run validation was 1461 batches against 60 training
+            # batches, i.e. most of the epoch was spent re-scoring near-copies.
+            for t in range(0, a.shape[0], self.stride):
+                self.index.append((fi, t))
+            del a
+        print(f"  SplitCacheDataset: {len(self.months)} months, "
+              f"{len(self.index)} timesteps"
+              + (f" (stride {self.stride})" if self.stride > 1 else ""))
+
+    def _get_map(self, fi):
+        m = self._maps.get(fi)
+        if m is None:
+            m = np.load(self.files[fi], mmap_mode="r")
+            self._maps[fi] = m
+        return m
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, i):
+        fi, t = self.index[i]
+        sample = self._get_map(fi)[t]
+        if self.crop_rows:
+            sample = sample[:, :self.crop_rows]
+        sample = np.asarray(sample, dtype=np.float32)
+        n_pred = ARDatasetImproved.N_PREDICTORS
+
+        x = (sample[:n_pred] - self.centre[:, None, None]) / self.scale[:, None, None]
+        y = sample[n_pred:]
+        if self.target_threshold is not None:
+            y = (y > self.target_threshold).astype(np.float32)
+
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        y = np.ascontiguousarray(y, dtype=np.float32)
+        try:
+            return (torch.from_numpy(x).to(dtype=self.dtype),
+                    torch.from_numpy(y).to(dtype=self.dtype))
+        except (TypeError, RuntimeError):
+            return (torch.tensor(x, dtype=self.dtype),
+                    torch.tensor(y, dtype=self.dtype))
+
+
+def split_cache_files(cache_dir=None, years=None):
+    """List split_YYYYMM.npy paths, optionally restricted to `years`."""
+    import glob as _glob
+    cache_dir = cache_dir or ARDatasetImproved.SPLIT_CACHE_DIR
+    out = []
+    for f in sorted(_glob.glob(os.path.join(cache_dir, "split_*.npy"))):
+        if f.endswith(".meta.npy"):
+            continue
+        stem = os.path.basename(f).replace("split_", "").replace(".npy", "")
+        if len(stem) != 6 or not stem.isdigit():
+            continue
+        if years is not None and int(stem[:4]) not in set(years):
+            continue
+        out.append(f)
+    return out

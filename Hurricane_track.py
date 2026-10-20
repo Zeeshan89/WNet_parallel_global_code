@@ -1,9 +1,12 @@
-
-## python Hurricane_track.py --model CNR --start-year 1980 --end-year 2014
-
 import os
 import glob
 import numpy as np
+import os as _os_mod
+
+
+def _os_env(k, d):
+    """Env lookup for tracker thresholds; defaults reproduce original behaviour."""
+    return _os_mod.environ.get(k, d)
 import xarray as xr
 import pandas as pd
 from scipy import ndimage
@@ -15,47 +18,22 @@ from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
 class HurricaneTracker:
-    def __init__(self, hurricane_data_dir, era5_data_dir, vorticity_dir, wind_speed_path, output_dir,
-                 file_prefix="era5dara_", inline_met_fields=False,
-                 mask_to_domain=False, domain_erode_cells=2):
+    def __init__(self, hurricane_data_dir, era5_data_dir, vorticity_dir, wind_speed_path, output_dir):
         """
         Initialize Hurricane Tracker for CONUS region
-
+        
         Args:
             hurricane_data_dir: Directory containing hurricane detection NetCDF files
-            era5_data_dir: Directory containing the paired input files (for MSLP, and
-                for RegCM also vorticity / wind_speed — see inline_met_fields)
-            vorticity_dir: Directory of separate yearly vorticity files (ERA5 layout).
-                Pass None for RegCM, where vorticity is inline in the paired file.
-            wind_speed_path: Path to a single wind-speed file (ERA5 layout). Pass None
-                for RegCM, where wind_speed is inline in the paired file.
+            era5_data_dir: Directory containing original ERA5 data files
+            vorticity_dir: Directory containing vorticity data files
+            wind_speed_path: Path to wind speed data file
             output_dir: Directory to save tracking results
-            file_prefix: detection/paired filename prefix. "era5dara_" for ERA5,
-                "<MODEL>dara_" for a RegCM model (e.g. "ACCdara_").
-            inline_met_fields: if True, read vorticity ('vorticity') and wind speed
-                ('wind_speed') from the paired file itself instead of the separate
-                ERA5 dirs. This is the RegCM layout (WNet_6hourly_latlon files carry
-                MSLP/vorticity/wind_speed together). Detection masks are unchanged by
-                the precip-MCS work, so hurricane tracking is identical across runs.
-            mask_to_domain: if True, zero the detection field wherever the driving
-                MSLP is NaN, i.e. outside RegCM's curved Lambert domain, before any
-                blob is formed. REQUIRED for RegCM — without it ~45% of all track
-                points are boundary artifacts pinned to lat 18.75. See _domain_mask.
-                Leave False for ERA5, which is global and has no such boundary.
-            domain_erode_cells: additionally drop cells within this many grid cells
-                of the domain boundary, where the CNN's zero-padding response reaches
-                inside the valid region. 0 disables the erosion.
         """
         self.hurricane_data_dir = hurricane_data_dir
         self.era5_data_dir = era5_data_dir
         self.vorticity_dir = vorticity_dir
         self.wind_speed_path = wind_speed_path
         self.output_dir = output_dir
-        self.file_prefix = file_prefix
-        self.inline_met_fields = inline_met_fields
-        self.mask_to_domain = mask_to_domain
-        self.domain_erode_cells = domain_erode_cells
-        self._domain_mask_cache = None
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
@@ -72,18 +50,8 @@ class HurricaneTracker:
         self.lsm_lons = self.lsm_mask.longitude.values
         print("Land-sea mask loaded successfully")
         
-        # CONUS region boundaries (hurricanes affecting Continental US).
-        # For RegCM these are narrowed to the model's own lat/lon box: the global
-        # +/-180 / +/-45 defaults are far wider than the data, which let the tracker
-        # accept detections right on the domain edge. The domain mask (mask_to_domain)
-        # is the load-bearing fix; this is the coarse outer guard.
-        if mask_to_domain:
-            self.region_bounds = {
-                'lon_min': -138.75, 'lon_max': -57.0,
-                'lat_min': 18.0,    'lat_max': 56.75,
-            }
-        else:
-            self.region_bounds = {
+        # CONUS region boundaries (hurricanes affecting Continental US)
+        self.region_bounds = {
                 'lon_min': -180.0,
                 'lon_max': 180.0,
                 'lat_min': -45.0,
@@ -108,6 +76,22 @@ class HurricaneTracker:
         # Meteorological parameters for hurricanes
         self.max_speed_kmh = 350  # 35 m/s converted to km per 6h (hurricanes can move faster than ETCs)
         self.min_speed_kmh = 40    # 2 m/s converted to km per 6h
+        # Linking speed window. The FLOOR is the dangerous one: a landfalling storm
+        # slows sharply, and centres are snapped to the 0.25 deg output grid, so two
+        # consecutive centres can land on the same cell -> displacement exactly 0 ->
+        # speed 0 -> the link is refused and the track breaks precisely where the
+        # storm stalls over land. Env-overridable so it can be measured; defaults
+        # reproduce the original 0.5-32 m/s window exactly.
+        self.min_speed_ms = float(_os_env("TC_MIN_SPEED_MS", "0.5"))
+        self.max_speed_ms = float(_os_env("TC_MAX_SPEED_MS", "32.0"))
+        # Land-aware gap bridging. Over ocean a long gap usually means two DIFFERENT
+        # storms, and widening the gap globally was measured to LOSE hits (318 ->
+        # 317 -> 315 for gap 4 -> 8 -> 12) by letting one track claim two storms.
+        # Over land the same gap means one storm weakening and possibly re-emerging
+        # (GULAB->SHAHEEN crossing India, FRED crossing Cuba), so the two cases want
+        # different limits. Default equals the ocean value, i.e. no behaviour change
+        # until asked for.
+        self.land_gap_steps = int(_os_env("TC_LAND_GAP_STEPS", "0"))
         
         self.min_path_km = 250.0        # Real hurricanes travel substantial distance
         self.min_hours = 48.0           # Minimum 48h duration (IBTrACS standard)
@@ -149,15 +133,25 @@ class HurricaneTracker:
         """
         Check if movement is meteorologically realistic (matching comparison code)
         """
-        distance = self.haversine_distance(lon1, lat1, lon2, lat2)
-        
+        # BUG FIX (2026-09-23): this call used to pass (lon1, lat1, lon2, lat2) into
+        # haversine_distance(lat1, lon1, lat2, lon2). The swap weights north-south
+        # motion by cos(lon1)*cos(lon2), which is ~0 near 90W and 90E, so a storm
+        # heading north at a US Gulf or Bay of Bengal landfall read as ~0 m/s, failed
+        # the speed floor, and its track was cut. TC_HAVERSINE_LEGACY=1 restores the
+        # old call so the pre-fix products can be reproduced byte-for-byte.
+        if _os_env("TC_HAVERSINE_LEGACY", "0") == "1":
+            distance = self.haversine_distance(lon1, lat1, lon2, lat2)
+        else:
+            distance = self.haversine_distance(lat1, lon1, lat2, lon2)
+
         if time_diff_hours <= 0:
             return False
         
         speed_ms = (distance * 1000.0) / (time_diff_hours * 3600.0)
         
-        # Moderate speed constraints: 0.5-32 m/s (allow stalling hurricanes like Harvey)
-        if speed_ms < 0.5 or speed_ms > 32.0:
+        # Moderate speed constraints (allow stalling hurricanes like Harvey).
+        # See self.min_speed_ms in __init__ for why the floor is the risky one.
+        if speed_ms < self.min_speed_ms or speed_ms > self.max_speed_ms:
             return False
         
         # Latitude change constraint
@@ -182,6 +176,7 @@ class HurricaneTracker:
             return False
         
         return True
+    
     def is_over_ocean(self, lat, lon, threshold=0.5):
         """
         Check if a location is over ocean using land-sea mask
@@ -274,52 +269,7 @@ class HurricaneTracker:
         dlon = lon2 - lon1
         a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
         return self.earth_radius_km * 2 * np.arcsin(np.sqrt(a))
-    def _domain_mask(self, mslp_data):
-        """True where the simulation actually exists, eroded by `domain_erode_cells`.
-
-        WHY THIS EXISTS — it removes ~half of all raw TC track points as artifacts.
-
-        RegCM runs on a curved Lambert grid inscribed in a lat/lon box, so ~28% of
-        the box has no simulated atmosphere and is NaN in every driving field. The
-        WNet nonetheless emits detections there, because the tensors were built with
-        fillna(0.0) and zero-padding convolutions produce a boundary response.
-
-        Measured on ACC (before this fix):
-          - detection fraction 9.1% in the southern rows vs 2.1% in the interior,
-            a 4.4x edge excess spanning ~7 rows (lat 18.0-19.5)
-          - 20,378 of 44,924 track points (45%) pinned to the single row lat=18.75
-          - 24 of 64 tracks in 2005 lay ENTIRELY outside the domain
-          - raw counts 59-71 tracks/yr against ~20/yr in IBTrACS
-
-        test.py::clean_edge_artifacts cannot fix this: it is written for a GLOBAL
-        periodic field, where the first/last rows are poles. On this regional domain
-        those rows are the box edge, and its "overwrite the edge with its interior
-        neighbour" rule PROPAGATES the artifact outward when the neighbour is itself
-        contaminated — which is why rows 0-2 (lat 18.00/18.25/18.50) are bit-identical
-        in the detection files. Its pole_rows=2 is also far shallower than the ~7-row
-        excess. (The same global-field assumption appears in
-        post_processing._label_lonwrap, which unions column 0 with column -1 and so
-        merges Oregon with the Carolinas.)
-
-        Masking on the driving field's own NaN pattern is preferable to trimming a
-        fixed number of edge rows: it follows the true curved boundary exactly and
-        needs no arbitrary constant. The erosion additionally drops cells within
-        `domain_erode_cells` of the boundary, where the CNN's padding response
-        reaches inside the valid region.
-        """
-        if self._domain_mask_cache is not None:
-            return self._domain_mask_cache
-        valid = ~np.isnan(np.asarray(mslp_data.isel(time=0).values))
-        if self.domain_erode_cells > 0:
-            valid = ndimage.binary_erosion(
-                valid, structure=np.ones((3, 3), dtype=bool),
-                iterations=self.domain_erode_cells, border_value=0)
-        self._domain_mask_cache = valid
-        print(f"  domain mask: {100.0 * valid.mean():.1f}% of the lat/lon box is "
-              f"inside the simulation (eroded {self.domain_erode_cells} cells)")
-        return valid
-
-    def extract_hurricane_centers(self, hurricane_mask, lats, lons, threshold=0.5):
+    def extract_hurricane_centers(self, hurricane_mask, lats, lons, threshold=0.5, mslp_field=None):
         """
         Extract hurricane centers from detection mask (CONUS region only)
         
@@ -358,8 +308,19 @@ class HurricaneTracker:
             if np.sum(single_hurricane) < self.min_hurricane_area:
                 continue
             
-            # Calculate center of mass
-            center_y, center_x = center_of_mass(single_hurricane)
+            # Centre. Default: mask centroid (original behaviour). TC_CENTER=mslp puts the
+            # centre on the MSLP minimum INSIDE the blob: the full-lifecycle masks are
+            # 200-500 km discs clipped by coastlines, so the centroid can sit well off
+            # the low, which jitters speeds, breaks links and flips ocean/land tests.
+            if _os_env("TC_CENTER", "mass") == "mslp" and mslp_field is not None:
+                _reg = mslp_field[np.ix_(lat_indices, lon_indices)]
+                _v = np.where(single_hurricane, _reg, np.inf)
+                if np.isfinite(_v).any():
+                    center_y, center_x = np.unravel_index(int(np.argmin(_v)), _v.shape)
+                else:
+                    center_y, center_x = center_of_mass(single_hurricane)
+            else:
+                center_y, center_x = center_of_mass(single_hurricane)
             
             # Convert pixel coordinates to lat/lon using regional coordinates
             if center_y < len(regional_lats) and center_x < len(regional_lons):
@@ -378,11 +339,20 @@ class HurricaneTracker:
                         continue
                     
                     # Check 2: Minimum intensity threshold
-                    if max_intensity < 0.40:  # Low to capture weak/forming phases
+                    if max_intensity < float(_os_env("TC_FRAME_INTENSITY", "0.40")):
                         continue
-                    
-                    # Check 3: Reasonable area (not too small, not suspiciously large)
-                    if area_pixels < 3 or area_pixels > 500:  # Keep low for detection continuity
+
+                    # Check 3: Reasonable area.
+                    # The 500 px ceiling was calibrated for the old heuristic, whose
+                    # detections were 200 km dilated centres (~163 px at 0.25 deg).
+                    # The IBTrACS target uses ROCI-sized discs — median 324 km
+                    # (~429 px), clamped to 500 km (~1018 px) — so measured on the
+                    # exported detections the old cap discards 34.1% of blobs, and
+                    # preferentially the LARGEST storms, breaking track continuity
+                    # for exactly the major hurricanes that matter most. A cap of
+                    # 2000 px rejects 0% while still excluding anything absurd.
+                    if area_pixels < int(_os_env("TC_MIN_AREA_PX", "3")) or \
+                            area_pixels > int(_os_env("TC_MAX_AREA_PX", "500")):
                         continue
                     
                     hurricane_centers.append({
@@ -510,7 +480,7 @@ class HurricaneTracker:
         print(f"\nProcessing year {year} for CONUS region...")
         
         # Get all hurricane detection files for this year
-        hurricane_pattern = os.path.join(self.hurricane_data_dir, f"{self.file_prefix}{year:04d}*Hurricane_detection.nc")
+        hurricane_pattern = os.path.join(self.hurricane_data_dir, f"era5dara_{year:04d}*Hurricane_detection.nc")
         hurricane_files = sorted(glob.glob(hurricane_pattern))
         
         if not hurricane_files:
@@ -519,21 +489,19 @@ class HurricaneTracker:
         
         print(f"Found {len(hurricane_files)} hurricane detection files for {year}")
         
-        # Load vorticity data for this year (ERA5 layout only). For RegCM
-        # (inline_met_fields) vorticity comes from the paired file per-timestep.
+        # Load vorticity data for this year
+        vorticity_file = self.find_vorticity_file(year)
         vorticity_ds = None
-        if not self.inline_met_fields and self.vorticity_dir:
-            vorticity_file = self.find_vorticity_file(year)
-            if vorticity_file:
-                print(f"Loading vorticity data: {os.path.basename(vorticity_file)}")
-                vorticity_ds = xr.open_dataset(vorticity_file).squeeze('plev')
-                vorticity_ds = vorticity_ds.assign_coords(
-                    longitude=(((vorticity_ds.longitude + 180) % 360) - 180)
-                ).sortby('longitude')
-
-        # Load wind speed data (ERA5 layout only). RegCM reads it inline below.
+        if vorticity_file:
+            print(f"Loading vorticity data: {os.path.basename(vorticity_file)}")
+            vorticity_ds = xr.open_dataset(vorticity_file).squeeze('plev')
+            vorticity_ds = vorticity_ds.assign_coords(
+                longitude=(((vorticity_ds.longitude + 180) % 360) - 180)
+            ).sortby('longitude')
+        
+        # Load wind speed data
         wind_speed_ds = None
-        if not self.inline_met_fields and self.wind_speed_path and os.path.exists(self.wind_speed_path):
+        if os.path.exists(self.wind_speed_path):
             print("Loading wind speed data...")
             wind_speed_ds = xr.open_dataset(self.wind_speed_path).squeeze('level')
             wind_speed_ds = wind_speed_ds.assign_coords(
@@ -544,7 +512,6 @@ class HurricaneTracker:
         all_detections = []
         conus_detections_count = 0
         total_detections_count = 0
-        masked_out_points = 0        # detections dropped as outside the domain
         
         # Process each file
         for file_idx, hurricane_file in enumerate(hurricane_files):
@@ -558,9 +525,6 @@ class HurricaneTracker:
             era5_file = era5_file.replace(self.hurricane_data_dir, self.era5_data_dir)
             
             mslp_data = None
-            vort_month = None       # RegCM inline vorticity for this month
-            wind_month = None       # RegCM inline wind speed for this month
-            domain_valid = None     # True where the simulation actually exists
             if os.path.exists(era5_file):
                 era5_ds = xr.open_dataset(era5_file)
                 era5_ds = era5_ds.assign_coords(
@@ -568,16 +532,6 @@ class HurricaneTracker:
                 ).sortby('longitude')
                 if 'MSLP' in era5_ds:
                     mslp_data = era5_ds['MSLP']
-                    if self.mask_to_domain:
-                        domain_valid = self._domain_mask(mslp_data)
-                # RegCM: vorticity + wind_speed live inline in the paired file
-                # (renamed vo850->vorticity, wspd850->wind_speed by the CDO step),
-                # mirroring how the WNet dataset loaders read them.
-                if self.inline_met_fields:
-                    if 'vorticity' in era5_ds:
-                        vort_month = era5_ds['vorticity'].load()
-                    if 'wind_speed' in era5_ds:
-                        wind_month = era5_ds['wind_speed'].load()
                 era5_ds.close()
             
             # Process each timestep
@@ -585,18 +539,16 @@ class HurricaneTracker:
                 hurricane_mask = hurricane_ds['Hurricane_detection'].values[time_idx]
                 lats = hurricane_ds.latitude.values
                 lons = hurricane_ds.longitude.values
-
-                # Drop detections outside the simulated domain BEFORE any blob is
-                # formed, so spurious edge cells can neither seed a track nor drag a
-                # centroid. See _domain_mask for the measurements motivating this.
-                if domain_valid is not None:
-                    hurricane_mask = np.where(domain_valid, hurricane_mask, 0.0)
-                    masked_out_points += int(np.sum(
-                        (hurricane_ds['Hurricane_detection'].values[time_idx] > 0.5)
-                        & ~domain_valid))
-
+                
                 # Extract hurricane centers (CONUS region only)
-                hurricanes = self.extract_hurricane_centers(hurricane_mask, lats, lons)
+                _mslp_c = None
+                if mslp_data is not None and _os_env("TC_CENTER", "mass") == "mslp":
+                    try:
+                        _mslp_c = mslp_data.sel(time=timestamp, method='nearest').values
+                    except Exception:
+                        _mslp_c = None
+                hurricanes = self.extract_hurricane_centers(hurricane_mask, lats, lons,
+                                                            mslp_field=_mslp_c)
                 conus_detections_count += len(hurricanes)
                 
                 # Count total detections for comparison (optional)
@@ -608,19 +560,12 @@ class HurricaneTracker:
                 if hurricanes:
                     # Get meteorological data for each hurricane
                     for hurricane in hurricanes:
-                        # Get vorticity data for this timestamp.
-                        # ERA5: separate yearly file (var138). RegCM: inline 'vorticity'
-                        # from the paired monthly file loaded above.
+                        # Get vorticity data for this timestamp
                         vor_data = None
                         if vorticity_ds is not None:
                             try:
                                 vor_time_data = vorticity_ds.sel(time=timestamp, method='nearest')
                                 vor_data = vor_time_data['var138'].values
-                            except:
-                                vor_data = None
-                        elif vort_month is not None:
-                            try:
-                                vor_data = vort_month.sel(time=timestamp, method='nearest').values
                             except:
                                 vor_data = None
                         
@@ -632,17 +577,11 @@ class HurricaneTracker:
                             except:
                                 mslp_time_data = None
                         
-                        # Get wind speed data for this timestamp.
-                        # ERA5: single file (wspd). RegCM: inline 'wind_speed'.
+                        # Get wind speed data for this timestamp
                         wind_time_data = None
                         if wind_speed_ds is not None:
                             try:
                                 wind_time_data = wind_speed_ds.sel(time=timestamp, method='nearest')['wspd'].values
-                            except:
-                                wind_time_data = None
-                        elif wind_month is not None:
-                            try:
-                                wind_time_data = wind_month.sel(time=timestamp, method='nearest').values
                             except:
                                 wind_time_data = None
                         
@@ -678,8 +617,6 @@ class HurricaneTracker:
         # Print regional filtering statistics
         print(f"Regional filtering results for {year}:")
         print(f"  - Total detections globally: {total_detections_count}")
-        if self.mask_to_domain:
-            print(f"  - Dropped as outside the simulated domain: {masked_out_points}")
         print(f"  - CONUS region detections: {conus_detections_count}")
         if total_detections_count > 0:
             print(f"  - CONUS percentage: {100.0 * conus_detections_count / total_detections_count:.1f}%")
@@ -698,18 +635,68 @@ class HurricaneTracker:
             print(f"Found {len(all_detections)} CONUS hurricane detections and {len(tracks)} tracks for year {year}")
         else:
             print(f"No CONUS hurricane detections found for year {year}")
+    # Rejection tally, so a run reports WHICH criterion discards tracks rather than
+    # leaving it to be guessed. These filters were tuned when the model emitted
+    # ~45,000 detections and aggressive filtering was essential; the IBTrACS-target
+    # model emits ~1,900, so several are now expected to cost real storms.
+    REJECT = {}
+
+    # The REJECT tally only sees tracks that already cleared close_track's own
+    # >=5 points AND >=48 h gates, so it under-reports: a candidate killed by
+    # those two never reaches validate_hurricane_track and is invisible here.
+    # With TC_CAPTURE_CANDIDATES=1 every closed candidate is recorded together
+    # with the criterion that ended it, which is what lets a miss be attributed
+    # to segmentation / linking / validation rather than guessed at. Off by
+    # default, so a production run behaves exactly as before.
+    # Did the land-aware bridge actually engage? A null result from a lever that
+    # never fired is not a null result, so this is counted rather than assumed.
+    LAND_BRIDGE = {"checked": 0, "over_land": 0, "extended": 0}
+    CANDIDATES = []
+    CAPTURE = bool(int(_os_env("TC_CAPTURE_CANDIDATES", "0")))
+    LAST_REJECT = None
+
+    @classmethod
+    def _capture(cls, dets, reason):
+        if not cls.CAPTURE:
+            return
+        cls.CANDIDATES.append({
+            "reason": reason,
+            "points": [(d['timestamp'], float(d['center_lat']),
+                        float(d['center_lon']), int(d.get('area_pixels', 0)))
+                       for d in dets],
+        })
+
+    def _rej(self, why):
+        HurricaneTracker.REJECT[why] = HurricaneTracker.REJECT.get(why, 0) + 1
+        HurricaneTracker.LAST_REJECT = why
+        return False
+
     def validate_hurricane_track(self, track_detections):
         """
-        STRICT validation matching IBTrACS comparison criteria
+        STRICT validation matching IBTrACS comparison criteria.
+
+        Thresholds are env-overridable so they can be re-tuned for a cleaner
+        detection field without editing this file. Defaults reproduce the original
+        behaviour exactly.
+          TC_MIN_POINTS TC_MIN_DURATION_H TC_MIN_PATH_KM TC_MIN_INTENSITY
+          TC_GENESIS_LAT TC_MIN_OCEAN_FRAC TC_MIN_STRAIGHTNESS
         """
-        if len(track_detections) < 5:
-            return False
+        import os as _os
+        _minpts = int(_os.environ.get("TC_MIN_POINTS", "5"))
+        if len(track_detections) < _minpts:
+            return self._rej("n_points")
         
         # ============================
         # 1. OCEAN GENESIS REQUIREMENT
         # ============================
-        if not self.requires_ocean_genesis(track_detections, min_ocean_points=1):
-            return False
+        # TC_OCEAN_GENESIS=0 disables this gate (default 1 = original behaviour). With the
+        # full-lifecycle TC model a storm stays detected over land, so a track can begin
+        # over land after a linking gap, or on a coastal/island centroid: Wilma 2005
+        # (160 kt) and Elena 1985 (110 kt) were detected at 92-100% of positions and
+        # rejected here.
+        if _os.environ.get("TC_OCEAN_GENESIS", "1") == "1" and \
+                not self.requires_ocean_genesis(track_detections, min_ocean_points=1):
+            return self._rej("ocean_genesis")
         
         # ============================
         # 2. FORMATION ZONE - Must start in tropics/subtropics
@@ -718,12 +705,13 @@ class HurricaneTracker:
         first_lon = track_detections[0]['center_lon']
         
         # Moderate: allow subtropical formation up to 38 degrees
-        if not (-38.0 <= first_lat <= 38.0):
-            return False
+        _glat = float(_os.environ.get("TC_GENESIS_LAT", "38.0"))
+        if not (-_glat <= first_lat <= _glat):
+            return self._rej("genesis_lat")
         
         # NEW: Exclude tracks starting north of 36N AND west of 80W (land-based systems)
         if first_lat >= 36.0 and first_lon <= -85.0:
-            return False
+            return self._rej("nw_landstart")
         
         # ============================
         # 3. LATITUDE CONSTRAINTS
@@ -731,12 +719,12 @@ class HurricaneTracker:
         # Allow more time at higher latitudes for recurving storms
         high_lat_count = sum(1 for d in track_detections if abs(d['center_lat']) > 45.0)
         if high_lat_count / len(track_detections) > 0.50:
-            return False
+            return self._rej("high_lat_frac")
         
         # NEW: Reject tracks north of 40N AND west of 110W (continental systems)
         for detection in track_detections:
             if detection['center_lat'] >= 40.0 and detection['center_lon'] <= -110.0:
-                return False
+                return self._rej("continental")
         
         # ============================
         # 4. OCEAN PERCENTAGE - Match comparison code
@@ -746,8 +734,8 @@ class HurricaneTracker:
         ocean_percentage = ocean_count / len(track_detections)
         
         # Allow hurricanes that persist over land after landfall
-        if ocean_percentage < 0.35:
-            return False
+        if ocean_percentage < float(_os.environ.get("TC_MIN_OCEAN_FRAC", "0.35")):
+            return self._rej("ocean_frac")
         
         # ============================
         # 5. DURATION CHECK - Match IBTrACS minimum
@@ -757,8 +745,8 @@ class HurricaneTracker:
         duration_hours = (end_time - start_time).total_seconds() / 3600.0
         
         # IBTrACS standard minimum
-        if duration_hours < 48.0:
-            return False
+        if duration_hours < float(_os.environ.get("TC_MIN_DURATION_H", "48.0")):
+            return self._rej("duration")
         
         # ============================
         # 6. PATH LENGTH
@@ -771,8 +759,8 @@ class HurricaneTracker:
             )
             total_distance += dist
         
-        if total_distance < 250.0:  # Slightly lower for short-lived but real TCs
-            return False
+        if total_distance < float(_os.environ.get("TC_MIN_PATH_KM", "250.0")):
+            return self._rej("path_km")
         
         # ============================
         # 7. MOVEMENT VALIDATION
@@ -800,7 +788,7 @@ class HurricaneTracker:
                 seen_west105 = True
             
             if seen_west105 and lat >= 35.0 and lon >= -100.0:
-                return False
+                return self._rej("west_recurve")
             
         # ============================
         # 8. SPEED VALIDATION
@@ -821,11 +809,11 @@ class HurricaneTracker:
                 speeds.append(speed_ms)
                 
                 # Moderate hurricane speed bounds: 0.5-32 m/s
-                if speed_ms < 0.5 or speed_ms > 32.0:
+                if speed_ms < self.min_speed_ms or speed_ms > self.max_speed_ms:
                     unrealistic_movements += 1
         
         if speeds and unrealistic_movements / len(speeds) > 0.3:
-            return False
+            return self._rej("speed")
         
         # ============================
         # 9. BAND LOGIC - Match comparison code
@@ -856,7 +844,7 @@ class HurricaneTracker:
         start_in_gulf = (first_lon <= -82.0 and self.is_over_ocean(first_lat, first_lon))
         if (east_fraction > 0.5 and entered_band and 
             not touched_ocean_in_band and not start_ocean_east82 and not start_in_gulf):
-            return False
+            return self._rej("band_ocean")
         
         # ============================
         # 10. INTENSITY CHECK
@@ -864,8 +852,8 @@ class HurricaneTracker:
         intensities = [d.get('max_intensity', 0) for d in track_detections]
         max_intensity = max(intensities) if intensities else 0
         
-        if max_intensity < 0.50:
-            return False
+        if max_intensity < float(_os.environ.get("TC_MIN_INTENSITY", "0.50")):
+            return self._rej("intensity")
         
         # ============================
         # 11. NET DISPLACEMENT - Progressive movement
@@ -878,8 +866,8 @@ class HurricaneTracker:
         # Net displacement should be at least 20% of total path
         if total_distance > 0:
             displacement_ratio = net_displacement / total_distance
-            if displacement_ratio < 0.12:
-                return False
+            if displacement_ratio < float(_os.environ.get("TC_MIN_STRAIGHTNESS", "0.12")):
+                return self._rej("straightness")
         
         # ============================
         # 12. BEARING CONSISTENCY - Reject zigzag/noise tracks
@@ -909,7 +897,7 @@ class HurricaneTracker:
                 return False
         
         return True
-    def create_hurricane_tracks(self, df, max_gap_steps=4):
+    def create_hurricane_tracks(self, df, max_gap_steps=None):
         """
         Create hurricane tracks from individual detections.
         Tracks persist across gaps of up to max_gap_steps consecutive missing
@@ -924,6 +912,8 @@ class HurricaneTracker:
             Maximum number of consecutive 6-h timesteps a track may survive
             without a matched detection before it is closed. Default 4 (= 24 h).
         """
+        if max_gap_steps is None:
+            max_gap_steps = int(_os_env("TC_MAX_GAP_STEPS", "4"))
         if df.empty:
             return []
         df = df.sort_values('timestamp').reset_index(drop=True)
@@ -951,15 +941,27 @@ class HurricaneTracker:
         active_tracks = []
         finished_tracks = []
         track_id_counter = [0]   # list so inner helpers can mutate it
+        # These two gates were hardcoded, which silently disabled the
+        # TC_MIN_POINTS / TC_MIN_DURATION_H knobs in validate_hurricane_track:
+        # a candidate under 5 points or 48 h died here and never reached the
+        # function those variables configure. They now read the SAME variables,
+        # with the same defaults, so the knobs actually do something.
+        _minpts_ct = int(_os_env("TC_MIN_POINTS", "5"))
+        _mindur_ct = float(_os_env("TC_MIN_DURATION_H", "48.0"))
+
         def close_track(tr):
             """Move a track from active → finished after validation."""
             dets = tr['detections']
-            if len(dets) < 5:
+            if len(dets) < _minpts_ct:
+                HurricaneTracker._capture(dets, "n_points_lt5")
                 return
             duration = (dets[-1]['timestamp'] - dets[0]['timestamp']).total_seconds() / 3600.0
-            if duration < 48.0:
+            if duration < _mindur_ct:
+                HurricaneTracker._capture(dets, "duration_lt48")
                 return
+            HurricaneTracker.LAST_REJECT = None
             if self.validate_hurricane_track(dets):
+                HurricaneTracker._capture(dets, "accepted")
                 finished_tracks.append({
                     'track_id'      : track_id_counter[0],
                     'detections'    : dets,
@@ -968,6 +970,9 @@ class HurricaneTracker:
                     'end_time'      : dets[-1]['timestamp'],
                 })
                 track_id_counter[0] += 1
+            else:
+                HurricaneTracker._capture(
+                    dets, f"rej:{HurricaneTracker.LAST_REJECT}")
         # ------------------------------------------------------------------ #
         # Main loop — one iteration per timestep                              #
         # ------------------------------------------------------------------ #
@@ -1036,7 +1041,20 @@ class HurricaneTracker:
                 else:
                     # ---- Miss: increment gap counter ---------------------
                     new_gap = tr['gap_count'] + 1
-                    if new_gap > max_gap_steps:
+                    # Over land, allow a longer bridge: the storm is weakening and
+                    # may re-emerge, whereas the same gap over ocean usually means
+                    # two different storms.
+                    _limit = max_gap_steps
+                    if self.land_gap_steps > max_gap_steps:
+                        HurricaneTracker.LAND_BRIDGE["checked"] += 1
+                        if not self.is_over_ocean(tr['ghost_lat'],
+                                                  tr['ghost_lon']):
+                            _limit = self.land_gap_steps
+                            HurricaneTracker.LAND_BRIDGE["over_land"] += 1
+                            if new_gap > max_gap_steps:
+                                # would have died at the ocean limit
+                                HurricaneTracker.LAND_BRIDGE["extended"] += 1
+                    if new_gap > _limit:
                         # Too many consecutive misses → close track
                         close_track(tr)
                     else:
@@ -1269,63 +1287,28 @@ class HurricaneTracker:
         print(f"CONUS hurricane tracking completed for years {start_year}-{end_year}")
 def main():
     """
-    Run CONUS hurricane tracking for a RegCM model and write per-year .txt tracks.
-
-    Hurricane detection masks are UNCHANGED by the precipitation-MCS work
-    (channels 0-10 are bit-identical), so this reads the same detection files the
-    precip test run emits — <MODEL>dara_YYYYMM_Hurricane_detection.nc — and needs
-    no re-inference for hurricanes. vorticity + wind_speed are read INLINE from the
-    paired WNet dara file (RegCM layout), so no separate ERA5 aux dirs are used.
-
-    Usage:
-        REGCM_MODEL=ACC python Hurricane_track.py
-        python Hurricane_track.py --model BCC --start-year 2005 --end-year 2014
-        python Hurricane_track.py --model ACC \
-            --hurricane-dir .../Outputs_RegCM_PR_ACC   # override detection source
+    Main function to run CONUS hurricane tracking
     """
-    KNOWN = ["ACC", "BCC", "CNR", "MPI", "MRI", "NOR"]
-    p = argparse.ArgumentParser(description="RegCM hurricane tracking -> per-year .txt")
-    p.add_argument("--model", default=os.environ.get("REGCM_MODEL", "ACC"),
-                   help=f"RegCM model ({'/'.join(KNOWN)}). Default $REGCM_MODEL or ACC.")
-    p.add_argument("--start-year", type=int, default=1980)
-    p.add_argument("--end-year", type=int, default=2014)
-    p.add_argument("--hurricane-dir", default=None,
-                   help="Detection dir (default: ARs_Hurricanes_ETCs_MCS/Outputs_RegCM_PR_<MODEL>)")
-    p.add_argument("--output-dir", default=None,
-                   help="Where to write tracks (default: <hurricane-dir>/Hurricane_tracks)")
-    args = p.parse_args()
-    model = args.model
-
-    HERE       = os.path.dirname(os.path.abspath(__file__))
-    REGCM_BASE = "/lustre/orion/cli138/proj-shared/dr6/eventtype/Data/RegCM-CMIP6/Data-processed"
-
-    # Detection masks from the precip test run; paired inputs (MSLP/vorticity/
-    # wind_speed inline) from the regridded WNet files.
-    hurricane_data_dir = args.hurricane_dir or os.path.join(
-        HERE, "ARs_Hurricanes_ETCs_MCS", f"Outputs_RegCM_PR_{model}")
-    era5_data_dir = os.path.join(REGCM_BASE, model, "WNet_6hourly_latlon")
-    output_dir = args.output_dir or os.path.join(hurricane_data_dir, "Hurricane_tracks")
-
-    if not os.path.isdir(hurricane_data_dir):
-        raise SystemExit(f"Detection dir not found: {hurricane_data_dir}\n"
-                         f"  (has {model} been tested? see Run_test_distributed.sh)")
-
+    # Configuration - adjust these paths according to your setup
+    hurricane_data_dir = "/lustre/orion/cli138/proj-shared/z7a/Storms_data/Storms_precipitation_notebooks/Percentile_ARs_detection/ARs_Hurricanes_ETCs_MCS/MCS_enhanced_trial61/ETCs_enchanced_test_etc_21"
+    era5_data_dir = "/lustre/orion/cli138/proj-shared/z7a/Storms_data/data/"
+    vorticity_dir = "/lustre/orion/cli138/proj-shared/z7a/Storms_data/vor850_latlongrid/vor850_latlongrid/"
+    wind_speed_path = "/lustre/orion/cli138/proj-shared/z7a/Storms_data/wind_speed_850/ERA5_windspeed_850mb_6hourly_final.nc"
+    output_dir = "/lustre/orion/cli138/proj-shared/z7a/Storms_data/Storms_precipitation_notebooks/Percentile_ARs_detection/ARs_Hurricanes_ETCs_MCS/MCS_enhanced_trial61/ETCs_enchanced_test_etc_21/Hurricanes_track_files_final_3"
+    # Create hurricane tracker for CONUS region
     tracker = HurricaneTracker(
         hurricane_data_dir=hurricane_data_dir,
         era5_data_dir=era5_data_dir,
-        vorticity_dir=None,          # RegCM: vorticity is inline in the paired file
-        wind_speed_path=None,        # RegCM: wind_speed is inline in the paired file
-        output_dir=output_dir,
-        file_prefix=f"{model}dara_",
-        inline_met_fields=True,
-        # RegCM is a regional domain: mask detections to where the simulation
-        # actually exists, otherwise ~45% of track points are boundary artifacts.
-        mask_to_domain=True,
-        domain_erode_cells=int(os.environ.get("TC_DOMAIN_ERODE", 2)),
+        vorticity_dir=vorticity_dir,
+        wind_speed_path=wind_speed_path,
+        output_dir=output_dir
     )
-    print(f"\n=== RegCM {model} hurricane tracking {args.start_year}-{args.end_year} ===")
-    tracker.run_tracking(start_year=args.start_year, end_year=args.end_year)
-
-
+    
+    # You can specify year range here
+    start_year = 2024  # Adjust as needed
+    end_year = 2024  # Adjust as needed - start with a small range for testing
+    
+    # Run tracking for CONUS region
+    tracker.run_tracking(start_year=start_year, end_year=end_year)
 if __name__ == "__main__":
     main()

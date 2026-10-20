@@ -47,6 +47,7 @@ import xarray as xr
 import matplotlib.pyplot as plt
 import os
 import sys
+import json
 import warnings
 from warnings import filterwarnings
 filterwarnings("ignore", category=DeprecationWarning)
@@ -88,9 +89,7 @@ from loss import DiceLoss, FocalLoss, NCutLoss2D, ARSegmentationLoss
 from metrics import SegmentationMetricAccumulator, format_metrics
 from utils import (setup_gpu, calculate_ivt, print_system_info,
                    find_matching_vorticity, find_latest_checkpoint,
-                   load_checkpoint, load_percentile_dataset, open_wnet_dataset,
-                   load_regcm_global_stats, load_regcm_bt_thresholds,
-                   load_regcm_pr_thresholds, regcm_checkpoint_dir)
+                   load_checkpoint, load_percentile_dataset)
 from visualization import visualize_four_class_segmentation, plot_training_history
 from loss import optimize_batch_size_for_gpu
 from cache_loader import CacheAwareDataLoader, get_cache_info
@@ -246,25 +245,28 @@ gradient_accumulation_steps = 3
 chunk_size                  = 12
 target_size                 = (192, 384)
 epochs_per_file             = 3
-# Val IoU plateaus by pass ~2, so the default 15 mostly burns walltime — and
-# overrunning the 55 min limit is what wall-killed the CNR/MRI runs. Override per
-# job without editing code:  sbatch --export=...,NUM_PASSES=8 ...
-num_passes                  = int(os.environ.get("NUM_PASSES", 15))
-in_channels                 = 14          # RegCM: 14 ch = 11 shared + MCS shield/blobs/core
-num_classes                 = 5           # RegCM: {bg, AR, Hurricane, ETC, MCS}
+num_passes                  = 20
 
-# ── RegCM-CMIP6 configuration ───────────────────────────────────────────────────
-# One code copy serves all six runs; select via `export REGCM_MODEL=ACC` before
-# launching. Also drives cache_loader's "<MODEL>dara_YYYYMM.nc" filename.
-REGCM_MODEL = os.environ.get("REGCM_MODEL", "ACC")
-REGCM_BASE  = "/lustre/orion/cli138/proj-shared/dr6/eventtype/Data/RegCM-CMIP6/Data-processed"
-REGCM_GS    = f"{REGCM_BASE}/{REGCM_MODEL}/global_stats"
-REGCM_DATA  = f"{REGCM_BASE}/{REGCM_MODEL}/WNet_6hourly_latlon/"
-# Per-model normalization stats from the CDO .txt files (drop-in for global_stats).
-REGCM_STATS = load_regcm_global_stats(REGCM_MODEL, REGCM_GS)
-# Per-model MCS BT shield/core thresholds (RegCM proxy runs colder than ERA5 Tb).
-REGCM_BT    = load_regcm_bt_thresholds(REGCM_MODEL, REGCM_GS)   # legacy BT A/B path only
-REGCM_PR    = load_regcm_pr_thresholds(REGCM_MODEL, REGCM_GS)   # MCS shield/core precip rates
+# ── Phase 1: predictor / label split ─────────────────────────────────────────
+# SPLIT_MODE=1 (or --split) feeds the model ONLY the 6 continuous physical
+# fields and hands the heuristic masks to the loss separately, so the copy
+# shortcut Phase 0 measured cannot be expressed. SPLIT_MODE=0 keeps the legacy
+# 14-channel contract for reproducing existing runs.
+SPLIT_MODE = os.environ.get("SPLIT_MODE", "0") == "1"
+in_channels = ARDatasetImproved.N_PREDICTORS if SPLIT_MODE else 14
+
+# Standardisation for the split predictors — built by compute_predictor_stats.py.
+# The split cache holds RAW physical values, so this file is what makes them
+# trainable; without it the dataset warns loudly and passes raw fields through.
+PREDICTOR_STATS_PATH = os.environ.get("PREDICTOR_STATS", "predictor_stats.json")
+predictor_stats = None
+if SPLIT_MODE:
+    try:
+        with open(PREDICTOR_STATS_PATH) as _f:
+            predictor_stats = json.load(_f)["stats"]
+    except Exception as _e:
+        print(f"⚠ SPLIT_MODE on but could not read {PREDICTOR_STATS_PATH} ({_e}). "
+              f"Run compute_predictor_stats.py first.")
 
 model        = None
 dataset      = None
@@ -275,65 +277,13 @@ losses       = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: which months actually have precipitation?
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _month_key(nc_file):
-    """'ACCdara_198001.nc' -> (1980, 1)"""
-    date = nc_file.split("_")[1].split(".")[0]
-    return int(date[:4]), int(date[4:6])
-
-
-def _available_precip_months(precip_dir, model, years, rank=0):
-    """Set of (year, month) that have precipitation, read from the yearly PR files.
-
-    Used to filter the training file list BEFORE it is sharded across ranks, so
-    every rank agrees and no rank diverges into the aux-gate skip mid-pass (which
-    deadlocks DDP). Cheap: one open per year, time coordinate only.
-
-    open_wnet_dataset normalises the calendar, so BCC/NOR (noleap, cftime) and the
-    gregorian models both yield datetime64 and `.dt.year`/`.dt.month` work for both.
-
-    Mirrors _load_aux_data exactly: it asks "does the file named for year Y contain
-    steps in month M **of year Y**?" — not merely "does month M appear anywhere in
-    that file". The distinction is load-bearing: the +90 min shift moves 12-31 22:30
-    into the next calendar year while `cdo mergetime` still files it under the old
-    year, so ACC_pr_6hourly_1980.nc carries a single 1981-01-01T00:00 step. Keying
-    off the filename year reads that as "1980-01 has data" and lets the empty month
-    back into the file list — reinstating the deadlock this filter exists to stop.
-    """
-    avail = set()
-    for y in years:
-        p = os.path.join(precip_dir, f"{model}_pr_6hourly_{y:04d}.nc")
-        if not os.path.exists(p):
-            if rank == 0:
-                print(f"  [precip scan] missing year file: {p}")
-            continue
-        try:
-            ds = open_wnet_dataset(p)
-            yy = ds["time"].dt.year.values
-            mm = ds["time"].dt.month.values
-            in_year = (yy == y)
-            for m in np.unique(mm[in_year]):
-                # >= 4 steps (one day) ignores single boundary steps carried in
-                # from an adjacent year; a real month has 112-124.
-                if int(((mm == m) & in_year).sum()) >= 4:
-                    avail.add((y, int(m)))
-            ds.close()
-        except Exception as e:
-            if rank == 0:
-                print(f"  [precip scan] unreadable {p}: {type(e).__name__}: {e}")
-    return avail
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Helper: process one monthly file  (extracted from the old monolithic loop)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _process_one_file(
     nc_file, file_idx, total_files,
     data_dir, cache_loader, vorticity_files, wind_speed_full,
-    temp_500mb_dir, windshear_dir, Bright_temp, Precip_dir,
+    temp_500mb_dir, windshear_dir, Bright_temp,
     vor850_results_per, windspeed_results_per, mslp_anom_result_glob,
     iwv_clim_result_glob,
     ibtracs_lookup, interp_percentile,
@@ -372,29 +322,51 @@ def _process_one_file(
         year     = int(date_str[:4])
         month    = int(date_str[4:6])
 
-        # ── Auxiliary data (RegCM) ─────────────────────────────────────────────
-        # RegCM regridded files carry `vorticity` and `wind_speed` INLINE (read
-        # from the main file inside cache_loader). temp_500mb / wind-shear do not
-        # exist in RegCM output → None (zero-filled). BT IS available now: yearly
-        # files `<MODEL>_bt_6hourly_{year}.nc`, var `bt`, sliced to this month.
+        # ── Auxiliary data ────────────────────────────────────────────────────
+        # IMPORTANT: aux loaders now LOG LOUDLY on missing-file or open-exception
+        # (was: silent fallback to None → silent zero-fill in dataset → degenerate
+        #  target masks → catastrophic-forgetting on otherwise-real training files).
+        # Every failure prints rank + file + error so concurrent-access races
+        # (e.g. multiple ranks opening the same yearly BT NetCDF) become visible.
         date_str_temp = f"{year:04d}{month:02d}"
         tag = "VAL" if is_val else "TRAIN"
 
-        temp_500mb_data      = None
-        windshear_data       = None
-        vorticity_month_data = None   # cache_loader pulls vorticity from the file
+        # 500 mb temperature
+        temp_500mb_data = None
+        temp_500mb_file = os.path.join(temp_500mb_dir, f"ERA5_t_500mb_{date_str_temp}.nc")
+        if os.path.exists(temp_500mb_file):
+            try:
+                temp_500mb_ds = xr.open_dataset(temp_500mb_file).sel(level="500")
+                temp_500mb_ds = temp_500mb_ds.assign_coords(
+                    longitude=(((temp_500mb_ds.longitude + 180) % 360) - 180)
+                ).sortby("longitude")
+                temp_500mb_data = temp_500mb_ds["T"]
+            except Exception as e:
+                print(f"  [Rank {rank}] [{tag}] AUX LOAD FAILED [temp_500mb] for {nc_file}: "
+                      f"{type(e).__name__}: {str(e)[:200]}")
+                temp_500mb_data = None
+        else:
+            print(f"  [Rank {rank}] [{tag}] AUX MISSING [temp_500mb] for {nc_file}: "
+                  f"{temp_500mb_file}")
 
-        # Brightness temperature (RegCM cloud-top proxy; clear-sky NaN handled in
-        # preprocess_data_improved via fillna). Bright_temp points at the RegCM BT dir.
-        bt_data = None
-        bt_file = os.path.join(Bright_temp, f"{REGCM_MODEL}_bt_6hourly_{year:04d}.nc")
+        # Brightness temperature
+        # Schema note: newer ERA5 BT files (re-downloaded via the updated CDS API)
+        # have a 'valid_time' dimension instead of 'time'. Older files use 'time'.
+        # We handle both via a conditional rename so the downstream sel(time=...)
+        # works either way.
+        bt_data  = None
+        bt_file  = os.path.join(Bright_temp, f"era5_bt_6hourly_{year:04d}.nc")
         if os.path.exists(bt_file):
             try:
                 bt_ds_tmp = xr.open_dataset(bt_file)
                 if "valid_time" in bt_ds_tmp.dims:
                     bt_ds_tmp = bt_ds_tmp.rename({"valid_time": "time"})
+                # Newer xarray rejects `method` together with a slice indexer
+                # (slices do range selection and don't need nearest matching).
+                # Use the actual last-day-of-month — "-31" fails for Apr/Jun/Sep/Nov
+                # (30 days) and Feb (28/29) on strict DatetimeIndex parsing.
                 _last_day = pd.Timestamp(year=year, month=month, day=1).days_in_month
-                bt_data = bt_ds_tmp.sel(
+                bt_data   = bt_ds_tmp.sel(
                     time=slice(f"{year:04d}-{month:02d}-01",
                                f"{year:04d}-{month:02d}-{_last_day:02d}")
                 )
@@ -405,28 +377,44 @@ def _process_one_file(
         else:
             print(f"  [Rank {rank}] [{tag}] AUX MISSING [BT] for {nc_file}: {bt_file}")
 
-        # Precipitation (pr, prc in mm/h) — the MCS source. open_wnet_dataset,
-        # not xr.open_dataset: BCC/NOR are noleap here too, and cftime vs
-        # datetime64 would break the time alignment in preprocess_data_improved.
-        pr_data = None
-        pr_file = os.path.join(Precip_dir, f"{REGCM_MODEL}_pr_6hourly_{year:04d}.nc")
-        if os.path.exists(pr_file):
+        # Wind shear
+        # Schema note: newer wind-shear NetCDFs ship the variable as 'windshear';
+        # older files used 'shear_mag'. Try the canonical name, fall back to the
+        # legacy name so both vintages work.
+        windshear_data = None
+        windshear_file = os.path.join(windshear_dir, f"6hourly_ERA5_windshear_mag_{date_str_temp}.nc")
+        if os.path.exists(windshear_file):
             try:
-                pr_ds_tmp = open_wnet_dataset(pr_file)
-                _last_day = pd.Timestamp(year=year, month=month, day=1).days_in_month
-                pr_data = pr_ds_tmp.sel(
-                    time=slice(f"{year:04d}-{month:02d}-01",
-                               f"{year:04d}-{month:02d}-{_last_day:02d}")
-                )
-                if pr_data.sizes.get("time", 0) == 0:
-                    print(f"  [Rank {rank}] [{tag}] AUX EMPTY [PR] for {nc_file}")
-                    pr_data = None
+                _ws_ds  = xr.open_dataset(windshear_file)
+                _ws_var = "windshear" if "windshear" in _ws_ds.data_vars else "shear_mag"
+                windshear_data = _ws_ds[_ws_var].squeeze()
             except Exception as e:
-                print(f"  [Rank {rank}] [{tag}] AUX LOAD FAILED [PR] for {nc_file}: "
+                print(f"  [Rank {rank}] [{tag}] AUX LOAD FAILED [windshear] for {nc_file}: "
                       f"{type(e).__name__}: {str(e)[:200]}")
-                pr_data = None
+                windshear_data = None
         else:
-            print(f"  [Rank {rank}] [{tag}] AUX MISSING [PR] for {nc_file}: {pr_file}")
+            print(f"  [Rank {rank}] [{tag}] AUX MISSING [windshear] for {nc_file}: "
+                  f"{windshear_file}")
+
+        # Vorticity
+        vorticity_month_data = None
+        vorticity_file = find_matching_vorticity(
+            pd.Timestamp(year=year, month=month, day=1), vorticity_files
+        )
+        if vorticity_file is not None:
+            try:
+                vorticity_ds = xr.open_dataset(vorticity_file).squeeze("plev")
+                vorticity_ds = vorticity_ds.assign_coords(
+                    longitude=(((vorticity_ds.longitude + 180) % 360) - 180)
+                ).sortby("longitude")
+                vorticity_month_data = vorticity_ds["var138"]
+            except Exception as e:
+                print(f"  [Rank {rank}] [{tag}] AUX LOAD FAILED [vorticity] for {nc_file}: "
+                      f"{type(e).__name__}: {str(e)[:200]}")
+                vorticity_month_data = None
+        else:
+            print(f"  [Rank {rank}] [{tag}] AUX MISSING [vorticity] for {nc_file}: "
+                  f"no matching vorticity file for {year}-{month:02d}")
 
         timing["aux_load"] = time.time() - _t; _t = time.time()
 
@@ -436,23 +424,18 @@ def _process_one_file(
         # entire storm classes — pulling the model toward "predict background
         # everywhere" and tanking val IoU. Better to skip the file entirely.
         #
-        # PR        → required for MCS target masks (channels 11, 12, 13).
-        #             Precipitation is the MCS source; without it every MCS mask
-        #             is empty and the model learns "MCS never happens" — a
-        #             SILENT failure, which is why this gate is not optional.
-        #             Expected to fire for 198001 only (RegCM SRF starts 1980-02).
+        # BT        → required for MCS target masks (channels 11, 12, 13)
         # vorticity → required for ETC + Hurricane vorticity components
         #             (channels 3, 8, 10) and CyTRACK-style hurricane centre detection
         #
         # temp_500mb and wind_shear are intentionally NOT critical: their absence
         # only relaxes the hurricane warm-core / shear filter rather than zeroing
         # an entire class's target — the model can still learn from such files.
-        # BT is no longer critical: the MCS branch is precipitation-based, and BT
-        # is kept only for the legacy mcs_source="bt" A/B path.
-        # RegCM: vorticity is read inline from the main file (not via the ERA5 aux dir).
         missing_critical = []
-        if pr_data is None:
-            missing_critical.append("PR")
+        if bt_data is None:
+            missing_critical.append("BT")
+        if vorticity_month_data is None:
+            missing_critical.append("vorticity")
 
         if missing_critical:
             print(f"  [Rank {rank}] [{tag}] HARD SKIP {nc_file}: missing critical aux "
@@ -500,7 +483,6 @@ def _process_one_file(
             wind_speed=wind_speed_full,
             temp_500mb=temp_500mb_data,
             BT_ds=bt_data,
-            PR_ds=pr_data,
             windhshear_ds=windshear_data,
             ivt_percentile=interp_percentile,
         )
@@ -525,14 +507,10 @@ def _process_one_file(
                                    else str(t) for t in time_values]
                     time_values = np.array(str_times, dtype="datetime64[s]")
             except Exception:
-                # open_wnet_dataset is imported at module scope. It must NOT be
-                # re-imported here: a function-local `from utils import ...` binds
-                # the name as local for the WHOLE function, so the earlier PR-loader
-                # call would raise UnboundLocalError before this line ever runs.
-                ERA5_tmp    = open_wnet_dataset(os.path.join(data_dir, nc_file))
+                ERA5_tmp    = xr.open_dataset(os.path.join(data_dir, nc_file))
                 time_values = ERA5_tmp["time"].values
         else:
-            ERA5_tmp    = open_wnet_dataset(os.path.join(data_dir, nc_file))
+            ERA5_tmp    = xr.open_dataset(os.path.join(data_dir, nc_file))
             time_values = ERA5_tmp["time"].values
 
         # ── Reconstruct lat/lon ───────────────────────────────────────────────
@@ -583,20 +561,22 @@ def _process_one_file(
         global_percentiles = {
             "vor850":          vor850_results_per,
             "windspeed":       windspeed_results_per,
-            "BT_boundary":     REGCM_BT["BT_boundary"],   # per-model (was ERA5 241.0)
-            "BT_core":         REGCM_BT["BT_core"],       # per-model (was ERA5 225.0)
-            # MCS is precipitation-based; BT_* above only feed the legacy
-            # mcs_source="bt" A/B path.
-            "PR_shield":       REGCM_PR["PR_shield"],     # mm/h, convective
-            "PR_core":         REGCM_PR["PR_core"],       # mm/h, convective
-            "PR_convfrac":     REGCM_PR["PR_convfrac"],   # prc/pr, dimensionless
+            "BT_boundary":     241.0,
+            "BT_core":         225.0,
             "Temp500":         270.0,
             "vor850_per_hurr": 1.45e-5,
             "windspeed_per_hurr": 8.0,
         }
 
-        # RegCM per-model stats from the CDO .txt files (loaded once at module top).
-        global_stats = REGCM_STATS
+        global_stats = {
+            "IVT":        {"mean": 170.566,    "std": 11.6209},
+            "IWV":        {"mean": 24.1535,    "std": 1.12097},
+            "BT":         {"mean": 254.675,    "std": 0.648636},
+            "MSLP":       {"mean": 101138.0,   "std": 15.6262},
+            "vorticity":  {"mean": -4.09177e-10, "std": 4.02875e-05},
+            "wind_speed": {"mean": 8.35723,    "std": 0.306227},
+            "temp_500mb": {"mean": 258.428,    "std": 0.832617},
+        }
 
         # ── Build ARDataset ───────────────────────────────────────────────────
         dataset = ARDatasetImproved(
@@ -612,7 +592,9 @@ def _process_one_file(
             mcs_moisture_mode="anomaly",              # "anomaly" | "anomaly_soft" | "absolute"
             ibtracs_lookup=ibtracs_this_month,
             year=year,
-            month=month
+            month=month,
+            output_mode=("split" if SPLIT_MODE else "legacy"),
+            predictor_stats=predictor_stats,
         )
 
         timing["dataset_init"] = time.time() - _t; _t = time.time()
@@ -652,6 +634,7 @@ def _process_one_file(
                 accumulator=val_accumulator,
                 use_amp=(scaler is not None),
                 rank=rank,
+                split=SPLIT_MODE,
             )
             timing["val"] = time.time() - _t
             if rank == 0:
@@ -684,6 +667,7 @@ def _process_one_file(
             ema=ema,
             file_idx=file_idx,
             global_epoch_offset=global_epoch_offset,
+            split=SPLIT_MODE,
         )
 
         timing["train"] = time.time() - _t
@@ -739,11 +723,16 @@ def main_improved(
     if rank == 0:
         print_system_info()
 
-    # ── Percentile / climatology datasets (RegCM per-model, from CDO Steps 1–3) ─
-    vor850_results_per_path    = f"{REGCM_GS}/{REGCM_MODEL}_vor850_75th.nc"
-    windspeed_results_per_path = f"{REGCM_GS}/{REGCM_MODEL}_windspeed850_75th.nc"
-    mslp_anomaly_glob          = f"{REGCM_GS}/{REGCM_MODEL}_mslp_monthly_climatology.nc"
-    iwv_climatology_glob       = f"{REGCM_GS}/{REGCM_MODEL}_iwv_monthly_climatology.nc"
+    # ── Percentile / climatology datasets ────────────────────────────────────
+    vor850_results_per_path    = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                                  "vor850_latlongrid/vor850_latlongrid/output/"
+                                  "vor850_75th_percentile_global.nc")
+    windspeed_results_per_path = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                                  "wind_speed_850/output/windspeed850_75th_percentile_global.nc")
+    mslp_anomaly_glob          = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                                  "data/global_stats/mslp_monthly_climatology.nc")
+    iwv_climatology_glob       = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                                  "data/global_stats/iwv_monthly_climatology.nc")
 
     vor850_results_per    = load_percentile_dataset(vor850_results_per_path,    rank)
     windspeed_results_per = load_percentile_dataset(windspeed_results_per_path, rank)
@@ -755,17 +744,27 @@ def main_improved(
     if rank == 0 and iwv_clim_result_glob is None:
         print(f"⚠ IWV climatology not found at {iwv_climatology_glob} — MCS uses absolute-IWV gate")
 
-    # ── Auxiliary data (RegCM) ────────────────────────────────────────────────
-    # vorticity & wind_speed are read INLINE from each regridded monthly file by
-    # cache_loader; temp_500mb / wind-shear do not exist in RegCM output. BT IS
-    # available: yearly files in <MODEL>/BT_6hourly_latlon/.
-    vorticity_files = []
-    wind_speed_full = None
-    temp_500mb_dir  = None
-    windshear_dir   = None
-    Bright_temp     = f"{REGCM_BASE}/{REGCM_MODEL}/BT_6hourly_latlon"
-    # Precipitation (pr, prc in mm/h) — MCS source; built by Run_PR_regrid.sh
-    Precip_dir      = f"{REGCM_BASE}/{REGCM_MODEL}/PR_6hourly_latlon"
+    # ── Auxiliary data paths ──────────────────────────────────────────────────
+    vorticity_dir  = ("/lustre/orion/cli138/proj-shared/z7a/Storms_data/"
+                      "vor850_latlongrid/vor850_latlongrid/")
+    vorticity_files = sorted(glob.glob(
+        os.path.join(vorticity_dir, "ERA5_vor_6hourly_*.850mb_latlon.nc")
+    ))
+
+    wind_speed_full = xr.open_dataset(
+        "/lustre/orion/cli138/proj-shared/z7a/Storms_data/"
+        "wind_speed_850/ERA5_windspeed_850mb_6hourly_final.nc"
+    ).squeeze("level")
+    wind_speed_full = wind_speed_full.assign_coords(
+        longitude=(((wind_speed_full.longitude + 180) % 360) - 180)
+    ).sortby("longitude")
+
+    temp_500mb_dir = ("/lustre/orion/proj-shared/cli138/dr6/eventtype/Data/ERA5/"
+                      "GLOBAL/from-ncar-server/t/monthly_output/6_hourly")
+    windshear_dir  = ("/lustre/orion/cli138/proj-shared/z7a/Storms_data/"
+                      "wind_shear_mag_sqrtu_v/")
+    Bright_temp    = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                      "OLR/brightness_temp_new/")
 
     # ── IBTrACS ───────────────────────────────────────────────────────────────
     ibtracs_file = ("/lustre/orion/proj-shared/cli138/dr6/eventtype/run-tracking/"
@@ -787,35 +786,12 @@ def main_improved(
 
     all_nc_files = sorted(
         f for f in os.listdir(data_dir)
-        if f.startswith(f"{REGCM_MODEL}dara_") and f.endswith(".nc") and _in_range(f)
+        if f.startswith("era5dara_") and f.endswith(".nc") and _in_range(f)
     )
-
-    # ── Drop months with no precipitation BEFORE sharding ─────────────────────
-    # MCS is precipitation-based, so a month without pr can never train. It must
-    # be removed from the file list rather than left for the critical-aux gate to
-    # skip later, because the gate fires on ONE rank while the other 63 enter real
-    # training — a divergence in the DDP collective sequence that HANGS the job
-    # until walltime. (198001 has no pr: RegCM SRF output starts 1980-02. It hit
-    # exactly this: rank 0 stalled on "File 5/5: <MODEL>dara_198001.nc" and every
-    # run died at epoch 12 = 4 files x 3 epochs, never finishing pass 1.)
-    #
-    # Filtering here is identical on every rank (same filesystem, same rule), so
-    # all ranks shard the same list and stay in lockstep. The gate stays in place
-    # as a genuine safety net for the unexpected.
-    _pr_months = _available_precip_months(Precip_dir, REGCM_MODEL,
-                                          range(start_year, end_year + 1), rank)
-    _before = len(all_nc_files)
-    all_nc_files = [f for f in all_nc_files
-                    if _month_key(f) in _pr_months]
-    _dropped = _before - len(all_nc_files)
 
     if rank == 0:
         print(f"\nFound {len(all_nc_files)} files for "
-              f"{start_year}/{start_month:02d} – {end_year}/{end_month:02d}"
-              + (f"  ({_dropped} dropped: no precipitation data)" if _dropped else ""))
-        if _dropped > 1:
-            print(f"  ⚠ {_dropped} months lack precipitation — only 198001 is expected. "
-                  f"Check {Precip_dir} before trusting this run.")
+              f"{start_year}/{start_month:02d} – {end_year}/{end_month:02d}")
         if not all_nc_files:
             print("No files found — exiting.")
             return
@@ -876,7 +852,7 @@ def main_improved(
     # warmup_epochs = min(10, total_training_epochs // 10)  # ~10% warmup
     warmup_epochs = min(5, total_training_epochs // 4)  # 5 global epochs w
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = ImprovedWNet(in_channels=in_channels, num_classes=num_classes).to(device)
+    model = ImprovedWNet(in_channels=in_channels, num_classes=5).to(device)
 
     base_lr      = 0.001
     # learning_rate = base_lr * world_size if distributed else base_lr
@@ -922,16 +898,14 @@ def main_improved(
             print("Model wrapped with DDP")
 
     # ── Cache loader ──────────────────────────────────────────────────────────
-    # Fresh per-model HDF5 cache dir kept EMPTY on purpose → forces the
-    # RegCM-aware NetCDF fallback (must NOT point at the shared ERA5 cache).
     cache_loader   = CacheAwareDataLoader(
-        cache_dir=f"../Percentile_ARs_detection/cache/preprocessed_RegCM_{REGCM_MODEL}"
+        cache_dir="../Percentile_ARs_detection/cache/preprocessed_v3"
     )
     interp_percentile = 400
 
-    # Shared with train.py (which writes ema_checkpoint_epoch_*.pth) via one
-    # definition, so the two can never drift onto different directories again.
-    checkpoint_dir = regcm_checkpoint_dir(REGCM_MODEL)
+    checkpoint_dir = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                      "Storms_precipitation_notebooks/WNet_parallel_global_code/"
+                      "ARs_Hurricanes_ETCs_MCS/Trail11")
     loss_details_dir = os.path.join(checkpoint_dir, "loss_details")
     if rank == 0:
         os.makedirs(loss_details_dir, exist_ok=True)
@@ -1004,7 +978,6 @@ def main_improved(
                 temp_500mb_dir=temp_500mb_dir,
                 windshear_dir=windshear_dir,
                 Bright_temp=Bright_temp,
-                Precip_dir=Precip_dir,
                 vor850_results_per=vor850_results_per,
                 windspeed_results_per=windspeed_results_per,
                 mslp_anom_result_glob=mslp_anom_result_glob,
@@ -1089,7 +1062,6 @@ def main_improved(
                     temp_500mb_dir=temp_500mb_dir,
                     windshear_dir=windshear_dir,
                     Bright_temp=Bright_temp,
-                    Precip_dir=Precip_dir,
                     vor850_results_per=vor850_results_per,
                     windspeed_results_per=windspeed_results_per,
                     mslp_anom_result_glob=mslp_anom_result_glob,
@@ -1201,11 +1173,10 @@ def main():
     if distributed:
         dist.barrier()
 
-    data_directory = REGCM_DATA
-    # Shared with train.py (which writes ema_checkpoint_epoch_*.pth) via one
-    # definition, so the two can never drift onto different directories again.
-    checkpoint_dir = regcm_checkpoint_dir(REGCM_MODEL)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    data_directory = "/lustre/orion/cli138/proj-shared/z7a/Storms_data/data/"
+    checkpoint_dir = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                      "Storms_precipitation_notebooks/WNet_parallel_global_code/"
+                      "ARs_Hurricanes_ETCs_MCS/Trail11")
     checkpoint_path = find_latest_checkpoint(checkpoint_dir)
 
     if rank == 0:

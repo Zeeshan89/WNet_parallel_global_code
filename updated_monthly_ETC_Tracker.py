@@ -9,51 +9,169 @@ import glob
 
 
 # =============================================================================
-# RegCM-CMIP6 DOMAIN
+# MOUNTAIN / OROGRAPHIC MASK
 # =============================================================================
-# The regridded RegCM grid: lon -138.75..-57.0, lat 18.0..56.75 (0.25 deg).
-# Everything outside this box is absent from the data, so global-scale criteria
-# written for the ERA5 version are inapplicable here and have been removed.
-REGCM_DOMAIN = {
-    'lon_min': -138.75, 'lon_max': -57.0,
-    'lat_min':   18.0,  'lat_max':  56.75,
-}
+# ETCs rarely form over or persist over high terrain.
+# These boxes are defined as (lon_min, lon_max, lat_min, lat_max, elev_label).
+# Any detected center whose (lon, lat) falls inside is discarded.
+#
+# Key regions:
+#   - Rocky Mountains / SW USA (the main offender you described)
+#   - Tibetan Plateau (massive orographic low factory)
+#   - Andes (strong orographic lows, not synoptic ETCs)
+#   - Greenland Ice Sheet
+#   - Antarctic continent (not relevant here but safe to include)
+#
+# TUNING TIP: if a real ETC occasionally passes over the edge of a box,
+# narrow the box.  If orographic noise still leaks, widen it.
+# =============================================================================
+MOUNTAIN_MASK_BOXES = [
+    # ---------- Rocky Mountains / SW USA (your primary complaint) ----------
+    # Core Rockies – Colorado, Utah, Wyoming, Nevada high terrain
+    (-115.0, -100.0, 35.0, 48.0),
+    # Sierra Nevada + Great Basin
+    (-122.0, -112.0, 36.0, 42.0),
+    # Mexican Plateau / Sierra Madre
+    (-108.0,  -95.0, 18.0, 32.0),
 
-# Paired WNet inputs, used only for their MSLP NaN pattern -> the true (curved
-# Lambert) domain mask. See ETCTracker._domain_mask.
-REGCM_INPUT_BASE = ("/lustre/orion/cli138/proj-shared/dr6/eventtype/Data/"
-                    "RegCM-CMIP6/Data-processed")
+    # ---------- Tibetan Plateau ----------
+    (70.0, 105.0, 28.0, 40.0),
+
+    # ---------- Andes ----------
+    (-80.0, -62.0, -55.0, 10.0),
+
+    # ---------- Greenland ----------
+    (-55.0, -15.0, 60.0, 85.0),
+
+    # ---------- Alps / Pyrenees (small – true ETCs pass through, orographic
+    #             lows stall; keep box tight so real tracks aren't blocked) ----------
+    (  5.0,  16.0, 44.0, 48.0),   # Alps core
+    ( -2.0,   3.0, 42.0, 44.0),   # Pyrenees core
+
+    # ---------- East African Highlands ----------
+    ( 33.0,  42.0, -5.0, 15.0),
+]
+
+
+def point_in_mountain_mask(lon, lat):
+    """Return True if (lon, lat) is inside any mountain mask box."""
+    for (lo_min, lo_max, la_min, la_max) in MOUNTAIN_MASK_BOXES:
+        if lo_min <= lon <= lo_max and la_min <= lat <= la_max:
+            return True
+    return False
 
 
 # =============================================================================
-# MOUNTAIN / OROGRAPHIC MASK — REMOVED for the RegCM North American domain
+# MOUNTAIN FRACTION FILTER FOR TRACKS
 # =============================================================================
-# The global ERA5 version of this tracker masked out high terrain (Rockies,
-# Tibetan Plateau, Andes, Greenland, Alps/Pyrenees, East African Highlands) to
-# suppress quasi-stationary orographic lows that are not synoptic ETCs.
+# A track is rejected if more than MOUNTAIN_TRACK_FRAC of its points lie
+# inside mountain boxes.  This catches tracks that spend most of their life
+# over terrain but briefly wander into clear sky at start/end.
 #
-# That filter is dropped here, for two independent reasons:
+# Both mask stages are env-configurable so the mask can be MEASURED rather than
+# assumed. Defaults reproduce the original behaviour exactly.
+#   ETC_MOUNTAIN_TRACK_FRAC   track-level threshold; >= 1.0 disables the rule
+#   ETC_MOUNTAIN_FRAME        "0" disables the per-detection centre rejection
 #
-#   1. Most of those boxes lie entirely OUTSIDE the RegCM domain
-#      (lon -138.75..-57, lat 18..56.75), so they could never match — Tibet,
-#      the Andes, Greenland, the Alps/Pyrenees and East Africa were dead code.
-#
-#   2. The remaining boxes (Rockies, Sierra Nevada/Great Basin, Mexican
-#      Plateau) cover the single most important ETC genesis region in this
-#      domain. Rocky Mountain LEE CYCLOGENESIS — Colorado lows and Alberta
-#      clippers — is genuine, well-documented synoptic ETC activity, not
-#      orographic noise. Masking it would delete real storms and bias the
-#      North American ETC climatology precisely where it matters most.
-#
-# The remaining track-quality filters (path length, propagation speed, median
-# speed, net eastward displacement, retrograde limits) already discriminate
-# stationary orographic lows from propagating ETCs on kinematic grounds, which
-# is the physically appropriate test in a regional domain.
+# Measured against TempestExtremes ETCs 2000-2010 (1465 tracks): 29.1% touch a
+# mountain box, 18.6% have their GENESIS inside one, and 19.1% exceed the 0.30
+# rule. The Rockies box alone is touched by 392 of them — that is lee cyclogenesis
+# (Colorado lows, Alberta clippers), real storms rather than orographic artefacts.
+# The artefact the mask targets is genuine (sea-level-reduced MSLP over high
+# terrain, and an 850 mb level that is below ground there), but a STATIONARY
+# artefact is better caught by the propagation criteria this tracker already has
+# (min_avg_propagation_ms, min_net_east_km, retrograde limits) than by a
+# geographic box that cannot distinguish a lee cyclone from an artefact.
+MOUNTAIN_TRACK_FRAC = float(os.environ.get("ETC_MOUNTAIN_TRACK_FRAC", "0.30"))
+MOUNTAIN_FRAME_MASK = os.environ.get("ETC_MOUNTAIN_FRAME", "1") not in ("0", "false", "False")
+
+# =============================================================================
+# TRACKER DESIGN SWITCHES (all default to the shipped behaviour)
+# =============================================================================
+# phase4_etc_miss_attribution.py (4123 NAECC cyclones, 2000-2010) showed where the misses
+# are: 35 % of all cyclones are lost at the TRACK stage (the mask covers them and a centre
+# is nearby, but no valid track results) against 11 % lost in the mask. Applied to the NAECC
+# tracks themselves, the rules below let only 53 % of real cyclones through: 52 % have a
+# 6-hourly step under the link floor, 19 % fail the path length, 18 % the retrograde limits,
+# 15 % the net-eastward rule. Slow, stalling and retrograde mature lows (Gulf of Alaska,
+# Labrador Sea) are exactly what these rules delete.
+#   ETC_MAX_GAP_STEPS     missed 6-h steps a track may bridge (shipped: 1; the TC tracker uses 4)
+#   ETC_FILTER_PROFILE    "legacy" = the shipped validation rules. "common" = only the QC every
+#                         reference catalogue gets (>= 48 h, >= 8 points, >= 1000 km net
+#                         displacement, median speed <= 28 m/s), and no lower link speed.
+#                         The link floor min_speed_kmh = 12 was meant as 12 km per 6 h (2 m/s)
+#                         but is compared with km/h, so a step under 72 km cannot be linked.
+#   ETC_LONWRAP           "1" joins blobs across the +-180 seam before centres are taken
+#   ETC_LINK_MODE         "legacy" = each track, oldest first, takes its nearest free centre.
+#                         "global" = all admissible (track, centre) pairs, continuing tracks
+#                         before gapped ones, nearest pair first.
+#   ETC_GAP_RADIUS_GROWTH the link radius grows to max_distance_km * (1 + gap * growth) while a
+#                         track is bridging a gap (shipped: 0.5, i.e. 2400 km at gap 4). The
+#                         first sweep showed gap bridging LOSING hits (NAEC POD 0.56 -> 0.22 at
+#                         gap 4): the grown radius lets a track jump to another low. 0 keeps
+#                         the radius at 800 km.
+#   ETC_CENTER_MODE       "centroid" = the blob centroid (shipped). "mslp" = one centre per
+#                         closed low of the ERA5 MSLP inside the blob (etc_closed_contour.py,
+#                         the TempestExtremes criterion: 200 Pa closed within 6 degrees), with
+#                         the intensity column = minimum MSLP in hPa. Blobs with no closed low
+#                         give no centre: the physical form of topography awareness.
+#   ETC_MSLP_DIR          where era5dara_YYYYMM.nc (variable MSLP) is read from in mslp mode
+#   ETC_CC_DEPTH_PA / ETC_CC_RADIUS_DEG / ETC_CC_SIGMA_KM   closed-contour depth, radius (also
+#                         the merge distance) and smoothing (defaults 200, 6, 75)
+MAX_GAP_STEPS = int(os.environ.get("ETC_MAX_GAP_STEPS", "1"))
+FILTER_PROFILE = os.environ.get("ETC_FILTER_PROFILE", "legacy")
+LONWRAP = os.environ.get("ETC_LONWRAP", "0") not in ("0", "false", "False")
+LINK_MODE = os.environ.get("ETC_LINK_MODE", "legacy")
+GAP_GROWTH = float(os.environ.get("ETC_GAP_RADIUS_GROWTH", "0.5"))
+CENTER_MODE = os.environ.get("ETC_CENTER_MODE", "centroid")
+MSLP_DIR = os.environ.get("ETC_MSLP_DIR", "/lustre/orion/cli138/proj-shared/z7a/Storms_data/data")
+CC_DEPTH_PA = float(os.environ.get("ETC_CC_DEPTH_PA", "200"))
+CC_RADIUS_DEG = float(os.environ.get("ETC_CC_RADIUS_DEG", "6"))
+CC_SIGMA_KM = float(os.environ.get("ETC_CC_SIGMA_KM", "75"))
+#   ETC_CENTER_FALLBACK_MIN  mslp mode only: a blob of at least this many cells that holds NO closed
+#                         low still yields its centroid (intensity = smoothed MSLP there, hPa).
+#                         0 (default) = such blobs yield nothing. Sweep 2: dropping them cut
+#                         NAEC FAR 0.34 -> 0.12 and duplicates 1027 -> 14 but POD 0.77 -> 0.61;
+#                         the fallback keeps cyclone-scale blobs (a 600 km label disc is ~1460
+#                         cells at 0.25 deg) while one-pixel fragments (~14 cells) stay dropped.
+CENTER_FALLBACK_MIN = int(os.environ.get("ETC_CENTER_FALLBACK_MIN", "0"))
+if FILTER_PROFILE not in ("legacy", "common") or LINK_MODE not in ("legacy", "global") \
+        or CENTER_MODE not in ("centroid", "mslp"):
+    raise ValueError(f"ETC_FILTER_PROFILE={FILTER_PROFILE!r} ETC_LINK_MODE={LINK_MODE!r} "
+                     f"ETC_CENTER_MODE={CENTER_MODE!r}")
+NON_DEFAULT = (MAX_GAP_STEPS != 1 or FILTER_PROFILE != "legacy" or LONWRAP or LINK_MODE != "legacy"
+               or GAP_GROWTH != 0.5 or CENTER_MODE != "centroid" or CENTER_FALLBACK_MIN > 0)
+if CENTER_MODE == "mslp":
+    import etc_closed_contour as _cc          # same directory as this file (not in the release copy)
+
+
+def label_blobs_lonwrap(field):
+    """ndimage.label (4-connected, as the shipped tracker) with blobs that touch across the
+    first and last longitude joined into one."""
+    labeled, n = ndimage.label(field)
+    if n < 2:
+        return labeled, n
+    parent = list(range(n + 1))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    left, right = labeled[:, 0], labeled[:, -1]
+    k = (left > 0) & (right > 0) & (left != right)
+    for a, b in set(zip(left[k].tolist(), right[k].tolist())):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+    roots = np.array([find(x) for x in range(n + 1)])
+    uniq, lut = np.unique(roots, return_inverse=True)
+    return lut[labeled], uniq.size - 1
 
 
 class ETCTracker:
-    def __init__(self, max_distance_km=800, min_track_length=8, region_bounds=None,
-                 domain_erode_cells=2):
+    def __init__(self, max_distance_km=800, min_track_length=8, region_bounds=None):
         """
         Initialize meteorologically-aware ETC tracker
 
@@ -100,12 +218,22 @@ class ETCTracker:
         self.direction_consistency_weight = 1.8
         self.time_gap_hours = 6
 
-        # ── Domain mask ──────────────────────────────────────────────────────
-        self.domain_erode_cells = domain_erode_cells
-        self._dmask_cache = None
-
         # ── Gap bridging ─────────────────────────────────────────────────────
-        self.max_gap_steps = 1   # allow 1 missed 6-h step
+        self.max_gap_steps = MAX_GAP_STEPS   # missed 6-h steps a track may bridge (shipped: 1)
+
+        # Net (first to last point) displacement floor; 0 disables. Only the
+        # "common" profile uses it, in place of the rules it switches off.
+        self.min_net_km = 0.0
+        if FILTER_PROFILE == "common":
+            self.min_speed_kmh = 0.0
+            self.min_path_km = 0.0
+            self.min_avg_propagation_ms = 0.0
+            self.min_median_speed_ms = 0.0
+            self.max_retro_run_hours = np.inf
+            self.max_retro_total_frac = 1.0
+            self.require_net_east = False
+            self.min_net_km = 1000.0
+        self.rejected = {}
 
         # ── Spatial filter ───────────────────────────────────────────────────
         # ETCs only in mid/high latitudes (kept at 28°, consistent with v1)
@@ -116,36 +244,36 @@ class ETCTracker:
         self.min_area = 15
 
         # ── Regional bounds ──────────────────────────────────────────────────
-        # Default = the RegCM North American domain. The global default
-        # (lon -180..0, lat 20..70) spanned ocean basins and both hemispheres
-        # that this regional dataset does not cover.
         if region_bounds is None:
-            self.region_bounds = REGCM_DOMAIN.copy()
+            self.region_bounds = {
+                'lon_min': -180.0, 'lon_max': 0.0,
+                'lat_min': 20.0,   'lat_max': 70.0
+            }
         else:
             self.region_bounds = region_bounds
 
-        # NOTE: the Southern-Hemisphere branch (track_both_hemispheres /
-        # get_hemisphere) has been dropped — this domain is entirely Northern
-        # Hemisphere (18..56.75 N), so that code could never execute.
+        self.track_both_hemispheres = (self.region_bounds['lat_min'] < 0 and
+                                        self.region_bounds['lat_max'] > 0)
 
-        print(f"Meteorological ETC Tracker (RegCM North America) initialized:")
+        print(f"Meteorological ETC Tracker v2 initialized:")
         print(f"  Regional bounds: Lon [{self.region_bounds['lon_min']}°, "
               f"{self.region_bounds['lon_max']}°], "
               f"Lat [{self.region_bounds['lat_min']}°, {self.region_bounds['lat_max']}°]")
+        print(f"  Tracking both hemispheres: {self.track_both_hemispheres}")
         print(f"  Max speed: {self.max_speed_kmh:.0f} km per 6h")
         print(f"  Max link distance: {self.max_distance_km} km")
         print(f"  Min path: {self.min_path_km} km")
         print(f"  Min avg propagation: {self.min_avg_propagation_ms} m/s")
         print(f"  Min median speed: {self.min_median_speed_ms} m/s")
         print(f"  Min net eastward: {self.min_net_east_km} km")
-        print(f"  Orographic mask: none (lee cyclogenesis retained)")
+        print(f"  Mountain mask: {len(MOUNTAIN_MASK_BOXES)} boxes active")
 
     # =========================================================================
     # HELPERS
     # =========================================================================
 
-    # (get_hemisphere removed — the RegCM domain is entirely Northern
-    #  Hemisphere, and nothing called it.)
+    def get_hemisphere(self, lat):
+        return 'NH' if lat >= 0 else 'SH'
 
     def haversine_distance(self, lon1, lat1, lon2, lat2):
         """Great-circle distance in km, handles dateline."""
@@ -237,15 +365,29 @@ class ETCTracker:
     # DETECTION: find centers in a single time-step field
     # =========================================================================
 
-    def find_etc_centers(self, detection_field, lons, lats):
-        labeled, num_features = ndimage.label(detection_field)
+    def find_etc_centers(self, detection_field, lons, lats, mslp=None):
+        if CENTER_MODE == "mslp":
+            if mslp is None:
+                raise ValueError("ETC_CENTER_MODE=mslp needs the MSLP field of the time step")
+            return self._mslp_centers(detection_field, lons, lats, mslp)
+        if LONWRAP:
+            labeled, num_features = label_blobs_lonwrap(detection_field)
+        else:
+            labeled, num_features = ndimage.label(detection_field)
         centers = []
         for i in range(1, num_features + 1):
             mask = (labeled == i)
             if np.sum(mask) < self.min_area:
                 continue
             y_idx, x_idx = np.where(mask)
-            cx = int(round(np.clip(np.mean(x_idx), 0, len(lons) - 1)))
+            if LONWRAP and x_idx.min() == 0 and x_idx.max() == len(lons) - 1:
+                # a blob across the seam: the plain mean of x would land near longitude 0
+                ang = 2.0 * np.pi * x_idx / len(lons)
+                mean_x = (np.arctan2(np.sin(ang).mean(), np.cos(ang).mean()) % (2.0 * np.pi)
+                          ) * len(lons) / (2.0 * np.pi)
+                cx = int(round(mean_x)) % len(lons)
+            else:
+                cx = int(round(np.clip(np.mean(x_idx), 0, len(lons) - 1)))
             cy = int(round(np.clip(np.mean(y_idx), 0, len(lats) - 1)))
             clon, clat = lons[cx], lats[cy]
             if np.isnan(clon) or np.isnan(clat):
@@ -254,49 +396,88 @@ class ETCTracker:
                 continue
             if abs(clat) < self.min_abs_lat:
                 continue
-            # (no orographic mask — see the note at the top of this file:
-            #  Rocky Mountain lee cyclogenesis is real ETC activity here)
+            # ── MOUNTAIN MASK (per-detection) ────────────────────────────────
+            if MOUNTAIN_FRAME_MASK and point_in_mountain_mask(clon, clat):
+                continue
             centers.append((clon, clat, int(np.sum(mask))))
         return centers
 
-    def _domain_mask(self, nc_file_path, lons, lats):
-        """True where the simulation exists, from the paired WNet input's MSLP NaNs.
+    def _mslp_centers(self, detection_field, lons, lats, mslp):
+        """One centre per closed MSLP low inside the mask blobs (ETC_CENTER_MODE=mslp). Blobs
+        under min_area are ignored as in centroid mode; a blob without a closed low yields
+        nothing. The candidate region is the filled blobs grown by 2 degrees, because the
+        label's wind gate leaves a hole at the calm centre of a cyclone."""
+        labeled, n = (label_blobs_lonwrap if LONWRAP else ndimage.label)(detection_field)
+        if n == 0:
+            return []
+        sizes = np.bincount(labeled.ravel(), minlength=n + 1)
+        ids = np.flatnonzero(sizes >= self.min_area)
+        ids = ids[ids > 0]
+        if ids.size == 0:
+            return []
+        cand = _cc.blob_candidate(np.isin(labeled, ids), lats, grow_deg=2.0)
+        p = _cc.smooth(mslp, lats, CC_SIGMA_KM) if CC_SIGMA_KM else np.asarray(mslp, np.float64)
+        centers = []
+        claimed = set()
+        dlat, dlon = abs(float(lats[1] - lats[0])), abs(float(lons[1] - lons[0]))
+        for la, lo, p0 in _cc.closed_lows(p, lats, lons, candidate=cand, depth_pa=CC_DEPTH_PA,
+                                          radius_deg=CC_RADIUS_DEG, merge_deg=CC_RADIUS_DEG,
+                                          sigma_km=0):
+            # the blob this low belongs to: the commonest blob label within ~2 degrees (the low
+            # may sit in a hole of the blob or in its grown margin, where `labeled` is 0)
+            iy = int(round((lats[0] - la) / -dlat)) if lats[0] < lats[-1] else int(round((lats[0] - la) / dlat))
+            ix = int(round((lo - lons[0]) / dlon)) % len(lons)
+            k = max(int(round(2.0 / dlat)), 1)
+            win = labeled[max(iy - k, 0):iy + k + 1][:, np.arange(ix - k, ix + k + 1) % len(lons)]
+            near = win[win > 0]
+            if near.size:
+                claimed.add(int(np.bincount(near).argmax()))
+            if not self.is_within_region(lo, la) or abs(la) < self.min_abs_lat:
+                continue
+            if MOUNTAIN_FRAME_MASK and point_in_mountain_mask(lo, la):
+                continue
+            centers.append((float(lo), float(la), float(p0) / 100.0))      # intensity = hPa
+        if CENTER_FALLBACK_MIN > 0:
+            for i in ids:
+                if int(i) in claimed or sizes[i] < CENTER_FALLBACK_MIN:
+                    continue
+                y_idx, x_idx = np.where(labeled == i)
+                cy = int(round(np.clip(np.mean(y_idx), 0, len(lats) - 1)))
+                cx = int(round(np.clip(np.mean(x_idx), 0, len(lons) - 1)))
+                clon, clat = float(lons[cx]), float(lats[cy])
+                if not self.is_within_region(clon, clat) or abs(clat) < self.min_abs_lat:
+                    continue
+                if MOUNTAIN_FRAME_MASK and point_in_mountain_mask(clon, clat):
+                    continue
+                centers.append((clon, clat, float(p[cy, cx]) / 100.0))
+        return centers
 
-        Same rationale as Hurricane_track._domain_mask: RegCM's curved Lambert domain
-        is inscribed in the lat/lon box, leaving ~28% of the box with no simulated
-        atmosphere, where the WNet still emits a boundary response (the tensors were
-        built with fillna(0.0) and the convolutions zero-pad).
-
-        Returns None if the paired file cannot be found, in which case tracking
-        proceeds unmasked exactly as before — this must never be a hard failure on a
-        layout it does not recognise.
-        """
-        if self._dmask_cache is not None:
-            return self._dmask_cache
-        base = os.path.basename(nc_file_path).replace('_ETCs_detection.nc', '.nc')
-        model = base.split('dara_')[0] if 'dara_' in base else None
-        if model is None:
-            return None
-        paired = os.path.join(REGCM_INPUT_BASE, model, "WNet_6hourly_latlon", base)
-        if not os.path.exists(paired):
-            print(f"    (no paired input {paired} — tracking UNMASKED)")
-            return None
-        with xr.open_dataset(paired) as pds:
-            if 'MSLP' not in pds:
-                return None
-            valid = ~np.isnan(pds['MSLP'].isel(time=0).values)
-        if valid.shape != (len(lats), len(lons)):
-            print(f"    (paired grid {valid.shape} != detection grid "
-                  f"{(len(lats), len(lons))} — tracking UNMASKED)")
-            return None
-        if self.domain_erode_cells > 0:
-            valid = ndimage.binary_erosion(
-                valid, structure=np.ones((3, 3), dtype=bool),
-                iterations=self.domain_erode_cells, border_value=0)
-        self._dmask_cache = valid
-        print(f"    domain mask: {100.0 * valid.mean():.1f}% of the box is inside "
-              f"the simulation (eroded {self.domain_erode_cells} cells)")
-        return valid
+    def _load_mslp(self, det_path, times, lons, lats):
+        """ERA5 MSLP (Pa) of the detection file's month, on the detection grid."""
+        from netCDF4 import Dataset, num2date
+        tag = os.path.basename(det_path).split("_")[1]          # era5dara_YYYYMM_ETCs_detection.nc
+        path = os.path.join(MSLP_DIR, f"era5dara_{tag}.nc")
+        with Dataset(path) as ds:
+            ds.set_auto_mask(False)
+            m = ds.variables["MSLP"][:].astype(np.float32)      # whole variable: time-deep chunks
+            lon = ds.variables["longitude"][:].astype(float)
+            lat = ds.variables["latitude"][:].astype(float)
+            tv = ds.variables["time"]
+            t = num2date(tv[:], tv.units, getattr(tv, "calendar", "standard"),
+                         only_use_cftime_datetimes=False, only_use_python_datetimes=True)
+        t = np.array([np.datetime64(x, "h") for x in t])
+        det_t = np.asarray(times).astype("datetime64[h]")
+        if t.size != det_t.size or not (t == det_t).all():
+            raise ValueError(f"{path}: time axis differs from {det_path}")
+        if lat[0] < lat[-1]:
+            m, lat = m[:, ::-1], lat[::-1]
+        if not np.allclose(lat, lats, atol=1e-3):
+            raise ValueError(f"{path}: latitude grid differs from the detections")
+        shift = int(np.argmin(np.abs(((lon - lons[0]) + 180.0) % 360.0 - 180.0)))
+        m = np.roll(m, -shift, axis=2)                          # source 0..360 -> detection -180..180
+        if np.nanmedian(m) < 2000.0:                            # hPa -> Pa
+            m *= 100.0
+        return m
 
     # =========================================================================
     # LINKING
@@ -365,15 +546,22 @@ class ETCTracker:
 
     def validate_track_meteorology(self, track):
         """Comprehensive meteorological + terrain validation."""
+        reason = self._first_failure(track)
+        if reason is not None:
+            self.rejected[reason] = self.rejected.get(reason, 0) + 1
+        return reason is None
+
+    def _first_failure(self, track):
+        """Name of the first validation rule the track fails, or None."""
         if len(track) < self.min_track_length:
-            return False
+            return "npts"
 
         # 1. Duration
         t0 = pd.to_datetime(track[0][0])
         t1 = pd.to_datetime(track[-1][0])
         duration_h = (t1 - t0).total_seconds() / 3600.0
         if duration_h < self.min_hours:
-            return False
+            return "hours"
 
         # 2. Total path length
         total_dist = sum(
@@ -382,7 +570,7 @@ class ETCTracker:
             for i in range(1, len(track))
         )
         if total_dist < self.min_path_km:
-            return False
+            return "path"
 
         # 3. Median speed
         speeds = []
@@ -396,32 +584,41 @@ class ETCTracker:
         if speeds:
             med = np.median(speeds)
             if med < self.min_median_speed_ms or med > self.max_median_speed_ms:
-                return False
+                return "median_speed"
 
         # 4. Average propagation speed (path efficiency)
         if duration_h > 0:
             avg_ms = (total_dist * 1000.0) / (duration_h * 3600.0)
             if avg_ms < self.min_avg_propagation_ms:
-                return False
+                return "propagation"
 
         # 5. Retrograde constraints
         retro_frac, retro_longest = self.calculate_retrograde_stats(track)
         if retro_longest > self.max_retro_run_hours:
-            return False
+            return "retro_run"
         if retro_frac > self.max_retro_total_frac:
-            return False
+            return "retro_frac"
 
         # 6. Net eastward displacement
         if self.require_net_east:
             net_east = self.calculate_net_zonal_displacement(track)
             if net_east < self.min_net_east_km:
-                return False
+                return "net_east"
 
-        # (7. track-level mountain-fraction test removed — see header note.
-        #  Stationary orographic lows are rejected kinematically by the path,
-        #  propagation-speed and net-eastward criteria above.)
+        # 6b. Net displacement, first point to last (the "common" profile only)
+        if self.min_net_km > 0 and self.haversine_distance(
+                track[0][1], track[0][2], track[-1][1], track[-1][2]) < self.min_net_km:
+            return "net_km"
 
-        return True
+        # 7. Mountain-mask fraction (track-level). MOUNTAIN_TRACK_FRAC >= 1.0
+        #    disables the rule, since a fraction can never exceed 1.
+        if MOUNTAIN_TRACK_FRAC < 1.0:
+            mountain_pts = sum(1 for _, lon, lat, _ in track
+                               if point_in_mountain_mask(lon, lat))
+            if mountain_pts / len(track) > MOUNTAIN_TRACK_FRAC:
+                return "mountain"
+
+        return None
 
     # =========================================================================
     # SINGLE-MONTH PROCESSOR (kept for backwards compatibility)
@@ -479,6 +676,58 @@ class ETCTracker:
         return len(valid)
 
     # =========================================================================
+    # GLOBAL LINKING (ETC_LINK_MODE=global)
+    # =========================================================================
+
+    def _link_global(self, active_tracks, curr_centers, time, claimed_curr):
+        """Link one time step over all admissible (track, centre) pairs at once: continuing
+        tracks before gapped ones, nearest pair first. Admissibility, the track update and
+        the gap rules are those of the legacy loop in process_multiple_months; only the
+        order in which tracks get to choose differs (legacy: oldest track first)."""
+        open_tracks = [(tid, ti) for tid, ti in active_tracks.items()
+                       if not ti.get('closed', False)]
+        pairs = []
+        for tid, ti in open_tracks:
+            gap_count = ti.get('gap_count', 0)
+            ref_lon = ti.get('ghost_lon', ti['points'][-1][1])
+            ref_lat = ti.get('ghost_lat', ti['points'][-1][2])
+            eff_max = self.max_distance_km * (1 + gap_count * GAP_GROWTH)
+            dt_h = self.time_gap_hours * (1 + gap_count)
+            for c_idx, (c_lon, c_lat, _) in enumerate(curr_centers):
+                dist = self.haversine_distance(ref_lon, ref_lat, c_lon, c_lat)
+                if dist < eff_max and self.is_realistic_movement(ref_lon, ref_lat,
+                                                                 c_lon, c_lat, dt_h):
+                    pairs.append((gap_count, dist, tid, c_idx))
+        pairs.sort()
+        linked = {}
+        for _, _, tid, c_idx in pairs:
+            if tid not in linked and c_idx not in claimed_curr:
+                linked[tid] = c_idx
+                claimed_curr.add(c_idx)
+
+        for tid, ti in open_tracks:
+            points = ti['points']
+            if tid in linked:
+                c_lon, c_lat, c_int = curr_centers[linked[tid]]
+                points.append((time, c_lon, c_lat, c_int))
+                if len(points) >= 2:
+                    ti['last_dlon'] = c_lon - points[-2][1]
+                    ti['last_dlat'] = c_lat - points[-2][2]
+                ti['gap_count'] = 0
+                ti['ghost_lon'] = c_lon
+                ti['ghost_lat'] = c_lat
+            else:
+                new_gap = ti.get('gap_count', 0) + 1
+                if new_gap > self.max_gap_steps:
+                    ti['closed'] = True
+                else:
+                    ref_lon = ti.get('ghost_lon', points[-1][1])
+                    ref_lat = ti.get('ghost_lat', points[-1][2])
+                    ti['gap_count'] = new_gap
+                    ti['ghost_lon'] = ref_lon + ti.get('last_dlon', 0.0)
+                    ti['ghost_lat'] = ref_lat + ti.get('last_dlat', 0.0)
+
+    # =========================================================================
     # MULTI-MONTH PROCESSOR (main workhorse, with gap bridging)
     # =========================================================================
 
@@ -498,25 +747,26 @@ class ETCTracker:
             lons     = ds.longitude.values
             lats     = ds.latitude.values
             etc_data = ds.ETCs_detection.values
-
-            # Zero detections outside the simulated domain before any blob forms.
-            # ETC is far less affected than TC (98.9% of ETC track points are already
-            # in-domain, because extratropical cyclones live at mid-latitudes where the
-            # curved Lambert domain fills the lat/lon box), but the same boundary
-            # response produces a specific artifact: ~8% of tracks (102 of 1283 for
-            # ACC) end with a spurious jump of ~1300 km in one 6 h step onto the single
-            # out-of-domain cell (-61.50, 28.00). Masking removes it at the source.
-            dmask = self._domain_mask(nc_file_path, lons, lats)
-            if dmask is not None:
-                etc_data = np.where(dmask[None, :, :], etc_data, 0.0)
+            mslp_month = None
+            if CENTER_MODE == "mslp":
+                mslp_month = self._load_mslp(nc_file_path, times, lons, lats)
+                inside = etc_data[0] > 0.5                  # a roll error would invert this
+                print(f"    MSLP check, first step: {mslp_month[0][inside].mean() / 100:.1f} hPa inside "
+                      f"the mask vs {mslp_month[0][~inside].mean() / 100:.1f} hPa outside")
 
             for t_idx, time in enumerate(times):
-                curr_centers = self.find_etc_centers(etc_data[t_idx], lons, lats)
+                curr_centers = self.find_etc_centers(
+                    etc_data[t_idx], lons, lats,
+                    mslp_month[t_idx] if mslp_month is not None else None)
                 total_detections += len(curr_centers)
 
                 claimed_curr = set()
 
-                for track_id, track_info in list(active_tracks.items()):
+                if LINK_MODE == "global":
+                    self._link_global(active_tracks, curr_centers, time, claimed_curr)
+
+                for track_id, track_info in (list(active_tracks.items())
+                                             if LINK_MODE == "legacy" else []):
                     if track_info.get('closed', False):
                         continue
                     points    = track_info['points']
@@ -529,7 +779,7 @@ class ETCTracker:
                         if c_idx in claimed_curr:
                             continue
                         dist = self.haversine_distance(ref_lon, ref_lat, c_lon, c_lat)
-                        eff_max = self.max_distance_km * (1 + gap_count * 0.5)
+                        eff_max = self.max_distance_km * (1 + gap_count * GAP_GROWTH)
                         if dist < eff_max and dist < best_dist:
                             dt_h = self.time_gap_hours * (1 + gap_count)
                             if self.is_realistic_movement(ref_lon, ref_lat,
@@ -589,6 +839,9 @@ class ETCTracker:
         print(f"  Total detections : {total_detections}")
         print(f"  Initial tracks   : {len(active_tracks)}")
         print(f"  Valid tracks     : {len(valid_tracks)}")
+        if self.rejected:
+            print("  Rejected by rule : " + ", ".join(
+                f"{k} {v}" for k, v in sorted(self.rejected.items(), key=lambda kv: -kv[1])))
 
         durations = []
         for track in valid_tracks.values():
@@ -624,7 +877,16 @@ class ETCTracker:
             f.write(f"# min_net_east_km        : {self.min_net_east_km}\n")
             f.write(f"# max_retro_run_hours    : {self.max_retro_run_hours}\n")
             f.write(f"# max_retro_total_frac   : {self.max_retro_total_frac}\n")
-            f.write(f"# orographic_mask        : none (lee cyclogenesis retained)\n")
+            f.write(f"# mountain_mask_boxes    : {len(MOUNTAIN_MASK_BOXES)}\n")
+            if NON_DEFAULT:          # written only for non-shipped settings: the default file stays identical
+                f.write(f"# design switches        : ETC_MAX_GAP_STEPS={MAX_GAP_STEPS} "
+                        f"ETC_FILTER_PROFILE={FILTER_PROFILE} ETC_LONWRAP={int(LONWRAP)} "
+                        f"ETC_LINK_MODE={LINK_MODE} ETC_GAP_RADIUS_GROWTH={GAP_GROWTH} "
+                        f"ETC_CENTER_MODE={CENTER_MODE} min_net_km={self.min_net_km}\n")
+                if CENTER_MODE == "mslp":
+                    f.write(f"# closed contour         : depth {CC_DEPTH_PA:.0f} Pa within {CC_RADIUS_DEG:g} deg, "
+                            f"smoothing {CC_SIGMA_KM:.0f} km, centroid fallback for blobs >= "
+                            f"{CENTER_FALLBACK_MIN} cells; INTENSITY column = MSLP (hPa)\n")
             f.write(f"# Total valid tracks     : {len(tracks)}\n")
             f.write("#\n# Format: TRACK_ID TIME LONGITUDE LATITUDE INTENSITY\n#\n")
 
@@ -649,52 +911,32 @@ class ETCTracker:
 # =============================================================================
 
 def main():
-    """Track ETCs for a RegCM model and write per-year .txt tracks.
+    etc_data_dir = (
+        '/lustre/orion/cli138/proj-shared/z7a/Storms_data/'
+        'Storms_precipitation_notebooks/Percentile_ARs_detection/'
+        'ARs_Hurricanes_ETCs_MCS/MCS_enhanced_trial58/'
+        'ETCs_enchanced_test_etc'
+    )
+    output_dir = (
+        '/lustre/orion/cli138/proj-shared/z7a/Storms_data/'
+        'Storms_precipitation_notebooks/Percentile_ARs_detection/'
+        'ARs_Hurricanes_ETCs_MCS/MCS_enhanced_trial58/'
+        'ETCs_enchanced_test_etc/ETC_track_files_yearly_5'
+    )
 
-    ETC detection is UNCHANGED by the precipitation-MCS work (channels 0-10 are
-    bit-identical), so this reads the same detection files the precip test run
-    emits: <MODEL>dara_YYYYMM_ETCs_detection.nc.
-
-    Usage:
-        REGCM_MODEL=ACC python updated_monthly_ETC_Tracker.py
-        python updated_monthly_ETC_Tracker.py --model BCC --start-year 2005 --end-year 2014
-    """
-    import argparse
-    KNOWN = ["ACC", "BCC", "CNR", "MPI", "MRI", "NOR"]
-    p = argparse.ArgumentParser(description="RegCM ETC tracking -> per-year .txt")
-    p.add_argument("--model", default=os.environ.get("REGCM_MODEL", "ACC"),
-                   help=f"RegCM model ({'/'.join(KNOWN)}). Default $REGCM_MODEL or ACC.")
-    p.add_argument("--start-year", type=int, default=1980)
-    p.add_argument("--end-year", type=int, default=2014)
-    p.add_argument("--etc-dir", default=None,
-                   help="Detection dir (default: ARs_Hurricanes_ETCs_MCS/Outputs_RegCM_PR_<MODEL>)")
-    p.add_argument("--output-dir", default=None,
-                   help="Where to write tracks (default: <etc-dir>/ETC_tracks)")
-    args = p.parse_args()
-    model = args.model
-
-    HERE = os.path.dirname(os.path.abspath(__file__))
-    etc_data_dir = args.etc_dir or os.path.join(
-        HERE, "ARs_Hurricanes_ETCs_MCS", f"Outputs_RegCM_PR_{model}")
-    output_dir = args.output_dir or os.path.join(etc_data_dir, "ETC_tracks")
-
-    min_year = args.start_year
-    max_year = args.end_year
-
-    if not os.path.isdir(etc_data_dir):
-        raise SystemExit(f"Detection dir not found: {etc_data_dir}\n"
-                         f"  (has {model} been tested? see Run_test_distributed.sh)")
+    min_year = 1980
+    max_year = 2024
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # RegCM North American domain (see REGCM_DOMAIN at the top of this file).
-    region_bounds = REGCM_DOMAIN.copy()
+    region_bounds = {
+        'lon_min': -180.0, 'lon_max': 180.0,
+        'lat_min':  -70.0, 'lat_max':  70.0
+    }
 
-    print(f"ETC Tracking System — RegCM {model} (North American domain)")
+    print("ETC Tracking System v2 (mountain-masked, tighter filters)")
     print("=" * 60)
     print(f"Processing years: {min_year} to {max_year}")
-    print(f"Input : {etc_data_dir}")
-    print(f"Output: {output_dir}")
     print("=" * 60)
 
     tracker = ETCTracker(
@@ -703,7 +945,7 @@ def main():
         region_bounds=region_bounds
     )
 
-    file_pattern = os.path.join(etc_data_dir, f"{model}dara_*_ETCs_detection.nc")
+    file_pattern = os.path.join(etc_data_dir, "era5dara_*_ETCs_detection.nc")
     nc_files = sorted(glob.glob(file_pattern))
 
     if not nc_files:
@@ -733,7 +975,7 @@ def main():
         print(f"\n{'='*60}\nPROCESSING YEAR {year}  ({len(year_files)} files)\n{'='*60}")
         try:
             out_path = os.path.join(output_dir,
-                                    f"ETC_tracks_{model}_{year}.txt")
+                                    f"ETC_tracks_{year}_meteorological_v2.txt")
             n = tracker.process_multiple_months(year_files, out_path)
             total_all += n
             ok_years  += 1

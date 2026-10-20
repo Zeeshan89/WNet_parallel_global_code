@@ -415,23 +415,14 @@ def visualize_four_class_segmentation(model, dataset, era5_dataset, vorticity, w
     first_timestamp = pd.Timestamp(time_values[indices[0]]).strftime('%Y%m%d_%H%M')
     output_type = "three_class_storm_detection"
     filename = nc_file.replace('.nc', f'_{output_type}_{first_timestamp}.png')
-    from utils import regcm_checkpoint_dir
-    output_directory = regcm_checkpoint_dir()
-    os.makedirs(output_directory, exist_ok=True)
+    output_directory = "/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/WNet_parallel_global_code/ARs_Hurricanes_ETCs_MCS/Trail11"
     filepath = os.path.join(output_directory, filename)
     print(f"Saving three-class visualization to: {filepath}")
     plt.savefig(filepath, format='png', bbox_inches='tight', dpi=300)
     plt.close(fig)
 
 
-def plot_training_history(losses, save_path=None):
-    # Save beside this run's own checkpoints. Uses the shared definition rather
-    # than re-deriving the path: a private copy here kept writing the precip-MCS
-    # run's plot into the BT-era Trail_RegCM_<MODEL>/, mislabelling the baseline.
-    if save_path is None:
-        from utils import regcm_checkpoint_dir
-        save_path = os.path.join(regcm_checkpoint_dir(), "training_history.png")
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+def plot_training_history(losses, save_path='/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/WNet_parallel_global_code/ARs_Hurricanes_ETCs_MCS/Trail11/training_history.png'):
     if isinstance(losses, list):
         # Legacy: plain list of total losses
         fig, ax = plt.subplots(figsize=(12, 4))

@@ -950,24 +950,10 @@ class ARSegmentationLoss(nn.Module):
         return etc_loss
 
     @autocast(enabled=False)
-    def compute_mcs_losses(self, mcs_probs, target_mcs, mcs_boundary_mask,
+    def compute_mcs_losses(self, mcs_probs, target_mcs, mcs_boundary_mask, 
                         mcs_core_pixels_mask, mcs_blobs_mask):
         """
         Compute MCS-specific losses - SIMPLIFIED using pre-processed blob masks
-
-        ⚠ PARAMETER NAMES ARE MISLEADING — the caller passes positionally
-        (mcs_probs, target_mcs, ch11, ch12, ch13), so:
-            mcs_boundary_mask    <- ch11 (mcs_boundary)   ✓ as named
-            mcs_core_pixels_mask <- ch12 (mcs_blobs)      ✗ and never used below
-            mcs_blobs_mask       <- ch13 (mcs_core)       ✗ despite the name
-        i.e. ch12 is dead in the loss and only ch11/ch13 affect training.
-
-        This is currently INERT: the precip branch sets ch13 == ch12, so the loss
-        receives the blob mask under either binding. It was left unfixed on purpose
-        — correcting it would change the trained objective at the same time as the
-        input field and confound attribution. If a gate is ever reintroduced that
-        makes ch13 != ch12 (e.g. mcs_source="bt", where ch13 = blobs * IWV gate),
-        this becomes live again and must be fixed first.
         """
         mcs_logits = torch.logit(mcs_probs.clamp(1e-7, 1-1e-7))
         
@@ -1010,84 +996,98 @@ class ARSegmentationLoss(nn.Module):
 
     def forward(self, seg_probs, inputs, target=None, batch_idx=0):
         """
-        Forward pass with memory optimization and autocast compatibility.
-        RegCM: 5 classes — background, AR, Hurricane, ETC, MCS (BT available).
-        Returns dictionary with individual and total losses for tracking.
+        Forward pass with memory optimization and autocast compatibility
+        Now handles 5 classes: background, AR, Hurricane, ETC, MCS
+        Returns dictionary with individual and total losses for tracking
         """
 
-        # Extract probability channels (5-class seg output: bg/AR/Hurr/ETC/MCS)
-        ar_probs = seg_probs[:, 1]  # AR class
-        hurricane_probs = seg_probs[:, 2]  # Hurricane class
-        etc_probs = seg_probs[:, 3]  # ETC class
-        mcs_probs = seg_probs[:, 4]  # MCS class
-
+        # Extract probability channels (now expecting 4 channels)
+        ar_probs = seg_probs[:, 1]  # AR class T
+        hurricane_probs = seg_probs[:, 2]  # Hurricane class T
+        etc_probs = seg_probs[:, 3]  # ETC class (new) T
+        mcs_probs = seg_probs[:, 4]  # MCS class (new) T
+        
         # Extract input channels
-        ivt_channel = inputs[:, 0]  # IVT
-        ivt_binary = inputs[:, 1]  # Binary IVT mask (AR detection)
-
+        ivt_channel = inputs[:, 0]  # IVT T
+        ivt_binary = inputs[:, 1]  # Binary IVT mask (AR detection) T
+        
         # Extract hurricane detection channels
         pressure_mask = inputs[:, 2]  # Low pressure mask
-        vorticity_mask = inputs[:, 3]  # High vorticity mask
+        vorticity_mask = inputs[:, 3]  # High vorticity mask  
         wind_speed_mask = inputs[:, 4]  # High wind speed mask
         strict_hurricane_eye_mask = inputs[:, 5]  # STRICT hurricane eye mask
         wind_speed_binary = inputs[:, 6]  # Wind speed binary mask
-
-        # Extract ETC detection channels
+        
+        # Extract ETC detection channels (new)
         etc_pressure_mask = inputs[:, 7]  # ETC low pressure mask
+        # etc_cold_core_mask = inputs[:, 13]  # ETC cold core mask
         etc_vorticity_mask = inputs[:, 8]  # ETC vorticity mask
         etc_wind_mask = inputs[:, 9]  # ETC wind speed mask
         etc_adaptive_mask = inputs[:, 10]  # ETC strict detection mask
+        
+        
+        # Extract MCS detection channels (new)
+        # # Note: Based on your channel layout from the dataloader
+        # mcs_convection_mask = inputs[:, 11]  # MCS deep convection mask
+        # mcs_precip_mask = inputs[:, 12]  # MCS heavy precipitation mask
+        # # mcs_wind_mask = inputs[:, 21]  # MCS wind speed mask
+        # mcs_core_mask = inputs[:, 13]  # MCS core detection mask
 
-        # Extract MCS detection channels (two-threshold approach)
-        mcs_convection_mask = inputs[:, 11]  # MCS boundary (241 K) mask
-        mcs_precip_mask = inputs[:, 12]  # MCS blobs mask
-        mcs_core_mask = inputs[:, 13]  # MCS core (225 K) mask
 
+        # Extract MCS detection channels (updated for two-threshold approach)
+        mcs_convection_mask = inputs[:, 11]  # MCS deep convection mask
+        mcs_precip_mask = inputs[:, 12]  # MCS heavy precipitation mask
+        mcs_core_mask = inputs[:, 13]  # MCS core detection mask
+    
         # Generate targets
         if target is None:
             target_ar = ivt_binary
             target_hurricane = strict_hurricane_eye_mask
-            target_etc = etc_adaptive_mask
-            target_mcs = mcs_core_mask
+            target_etc = etc_adaptive_mask  # New ETC target
+            target_mcs = mcs_core_mask  # New MCS target
         else:
             target_ar = target[:, 1]
             target_hurricane = target[:, 2]
-            target_etc = target[:, 3]
-            target_mcs = target[:, 4]
-
+            target_etc = target[:, 3]  # New ETC target
+            target_mcs = target[:, 4]  # New MCS target
+        
         # Compute AR losses
         ar_loss = self.compute_ar_losses(ar_probs, target_ar, ivt_channel, ivt_binary)
-
+        
         # Compute hurricane losses
         hurricane_loss = self.compute_hurricane_losses(
-            hurricane_probs, target_hurricane, wind_speed_mask, vorticity_mask,
+            hurricane_probs, target_hurricane, wind_speed_mask, vorticity_mask, 
             pressure_mask, strict_hurricane_eye_mask, wind_speed_binary
         )
-
-        # Compute ETC losses
+        
+        # Compute ETC losses (new)
         etc_loss = self.compute_etc_losses(
             etc_probs, target_etc, etc_pressure_mask,
             etc_vorticity_mask, etc_wind_mask, etc_adaptive_mask
         )
-
-        # Compute MCS losses (two-threshold approach)
+        
+        # Compute MCS losses (updated for two-threshold approach)
         mcs_loss = self.compute_mcs_losses(
             mcs_probs, target_mcs, mcs_convection_mask, mcs_precip_mask, mcs_core_mask)
-
-        # Prevent overlaps between storm types
+        
+        # # Compute MCS losses (new)
+        # mcs_loss = self.compute_mcs_losses(
+        #     mcs_probs, target_mcs, mcs_convection_mask, mcs_precip_mask, mcs_core_mask)
+        
+        # Prevent overlaps between storm types (expanded for MCS)
         ar_hurricane_overlap = (ar_probs * hurricane_probs).mean()
         ar_etc_overlap = (ar_probs * etc_probs).mean()
-        ar_mcs_overlap = (ar_probs * mcs_probs).mean()
+        ar_mcs_overlap = (ar_probs * mcs_probs).mean()  # New
         hurricane_etc_overlap = (hurricane_probs * etc_probs).mean()
-        hurricane_mcs_overlap = (hurricane_probs * mcs_probs).mean()
-        etc_mcs_overlap = (etc_probs * mcs_probs).mean()
-
-        total_overlap_loss = (ar_hurricane_overlap + ar_etc_overlap + ar_mcs_overlap +
+        hurricane_mcs_overlap = (hurricane_probs * mcs_probs).mean()  # New
+        etc_mcs_overlap = (etc_probs * mcs_probs).mean()  # New
+        
+        total_overlap_loss = (ar_hurricane_overlap + ar_etc_overlap + ar_mcs_overlap + 
                             hurricane_etc_overlap + hurricane_mcs_overlap + etc_mcs_overlap)
-
-        # Total loss (includes MCS)
+        
+        # Total loss (now includes MCS)
         total_loss = ar_loss + hurricane_loss + etc_loss + mcs_loss + total_overlap_loss
-
+        
         # Return dictionary with individual losses for tracking
         return {
             'total_loss': total_loss,
@@ -1146,3 +1146,314 @@ def optimize_batch_size_for_gpu(model, sample_input, max_batch_size=32):
     
     model.train()
     return 1  # Fallback to batch size 1
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 1 — loss for the split (predictors / labels) contract
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class StormSegLoss(nn.Module):
+    """Segmentation loss that reads its targets from a SEPARATE label tensor.
+
+    ARSegmentationLoss pulled its targets out of the input tensor itself
+    (loss.py:1043-1047), which is what let the model satisfy it by copying a
+    channel through. This one takes `labels` explicitly, so it cannot be
+    satisfied that way — the model only ever sees physical fields.
+
+    Deliberately minimal. The old per-class stack of seven terms (bce, dice,
+    pattern, intensity, consistency, positive, focal) all scored the SAME mask,
+    so it was one loss with an opaque effective weight. Here each class gets
+    BCE (imbalance-corrected) + Dice, and the inter-class overlap penalty is
+    kept so that Phase 1 changes only the input contract, nothing else. Choosing
+    between softmax/mutual-exclusivity and independent sigmoid heads is Phase 2.
+
+    Args:
+        class_weight     : per-class scale, ordered (AR, Hurricane, ETC, MCS).
+        target_threshold : labels are stored as floats (ETC carries a graded
+                           intensity); this binarises them for the loss.
+        use_pos_weight   : counter the extreme foreground imbalance (a hurricane
+                           eye is ~0.3% of the globe) with a per-batch
+                           negative/positive ratio in the BCE.
+        max_pos_weight   : clamp on that ratio, so an almost-empty batch cannot
+                           produce an enormous gradient.
+    """
+
+    def __init__(self,
+                 class_weight=(10.0, 15.0, 12.0, 10.0),
+                 target_threshold: float = 0.5,
+                 dice_weight: float = 1.0,
+                 overlap_weight: float = 1.0,
+                 use_pos_weight: bool = True,
+                 max_pos_weight: float = 50.0):
+        super().__init__()
+        self.class_weight = list(class_weight)
+        self.target_threshold = target_threshold
+        self.dice_weight = dice_weight
+        self.overlap_weight = overlap_weight
+        self.use_pos_weight = use_pos_weight
+        self.max_pos_weight = max_pos_weight
+        self.class_names = ["ar", "hurricane", "etc", "mcs"]
+
+    @staticmethod
+    def _dice(probs, target, smooth=1e-6):
+        num = 2.0 * (probs * target).sum() + smooth
+        den = probs.sum() + target.sum() + smooth
+        return 1.0 - num / den
+
+    def forward(self, seg_probs, labels, inputs=None, batch_idx=0):
+        """
+        seg_probs : (B, 5, H, W) softmax over {background, AR, Hurricane, ETC, MCS}
+        labels    : (B, 4, H, W) heuristic masks, ordered (AR, Hurricane, ETC, MCS)
+        inputs    : accepted and ignored — kept so callers can pass predictors
+                    without the loss ever being able to read a target from them.
+        """
+        if labels.shape[1] != 4:
+            raise ValueError(f"expected 4 label channels, got {labels.shape[1]}")
+        if seg_probs.shape[1] != 5:
+            raise ValueError(f"expected 5 segmentation classes, got {seg_probs.shape[1]}")
+
+        # logit() and the ratio arithmetic are unstable in fp16 — force fp32.
+        seg_probs = seg_probs.float()
+        labels = labels.float()
+
+        per_class = {}
+        total = seg_probs.new_zeros(())
+
+        for i, name in enumerate(self.class_names):
+            probs = seg_probs[:, i + 1]
+            target = (labels[:, i] > self.target_threshold).float()
+            logits = torch.logit(probs.clamp(1e-7, 1 - 1e-7))
+
+            pos_weight = None
+            if self.use_pos_weight:
+                n_pos = target.sum()
+                n_neg = target.numel() - n_pos
+                if n_pos > 0:
+                    pos_weight = torch.clamp(n_neg / n_pos, min=1.0,
+                                             max=self.max_pos_weight)
+
+            bce = F.binary_cross_entropy_with_logits(
+                logits, target, pos_weight=pos_weight, reduction="mean")
+            dice = self._dice(probs, target)
+
+            loss_c = self.class_weight[i] * (bce + self.dice_weight * dice)
+            per_class[name] = loss_c
+            total = total + loss_c
+
+        # Keep the classes from claiming the same pixels (softmax already makes
+        # argmax exclusive, but the probabilities themselves can co-fire).
+        overlap = seg_probs.new_zeros(())
+        for a in range(1, 5):
+            for b in range(a + 1, 5):
+                overlap = overlap + (seg_probs[:, a] * seg_probs[:, b]).mean()
+        total = total + self.overlap_weight * overlap
+
+        return {
+            "total_loss":     total,
+            "ar_loss":        per_class["ar"].detach(),
+            "hurricane_loss": per_class["hurricane"].detach(),
+            "etc_loss":       per_class["etc"].detach(),
+            "mcs_loss":       per_class["mcs"].detach(),
+            "overlap_loss":   overlap.detach(),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2 — multi-label loss + a corrected N-cut regulariser
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class NCutLoss2DFixed(nn.Module):
+    """Soft N-cut regulariser over a MULTI-CHANNEL feature space.
+
+    Two corrections to NCutLoss2D, which was defined but never called anywhere
+    in training:
+
+    1. It collapsed the inputs with `inputs.mean(dim=1)` before measuring
+       similarity. Averaging six standardised but physically unrelated fields
+       (IVT, MSLP, vorticity, wind speed, BT, IWV) into one scalar destroys the
+       feature space the cut is supposed to respect — a cold moist pixel and a
+       warm dry one can average to the same number. Here the squared distance is
+       summed across channels, i.e. the proper multivariate form. The original
+       code already summed over dim=1, so it was structurally ready for this;
+       only the pre-averaging was in the way.
+
+    2. Its weights were `exp(-(d^2)^2 / sigma^2)` because `diff` was already a
+       squared distance and was then squared again. Soft N-cut wants
+       `exp(-d^2 / sigma^2)`. The extra power made the affinity collapse to zero
+       for all but near-identical pixels, so the term carried almost no signal.
+
+    This is a per-class association term (class-mean form, not full pairwise), so
+    it composes with independent sigmoid heads — it does not require the class
+    probabilities to form a partition.
+    """
+
+    def __init__(self, radius: int = 4, sigma_1: float = 4.0, sigma_2: float = 2.0):
+        super().__init__()
+        self.radius = radius
+        self.sigma_1 = sigma_1     # spatial std of the neighbourhood kernel
+        self.sigma_2 = sigma_2     # feature-space std
+        self.kernel = None
+
+    def forward(self, probs: Tensor, inputs: Tensor) -> Tensor:
+        """probs: (B, C, H, W) per-class probabilities. inputs: (B, C_in, H, W)."""
+        probs = probs.float()
+        inputs = inputs.float()
+        n_classes = probs.shape[1]
+
+        if (self.kernel is None or self.kernel.device != probs.device
+                or self.kernel.dtype != probs.dtype):
+            self.kernel = gaussian_kernel(radius=self.radius, sigma=self.sigma_1,
+                                          device=probs.device).to(probs.dtype)
+
+        total = probs.new_zeros(())
+        for k in range(n_classes):
+            p = probs[:, k].unsqueeze(1)                       # (B,1,H,W)
+            denom_mean = p.mean(dim=(2, 3), keepdim=True) + 1e-5
+            # per-channel weighted mean of the inputs inside class k
+            class_mean = (inputs * p).mean(dim=(2, 3), keepdim=True) / denom_mean
+            # squared distance in the FULL feature space
+            d2 = (inputs - class_mean).pow(2).sum(dim=1, keepdim=True)
+            w = torch.exp(-d2 / (self.sigma_2 ** 2))
+            num = torch.sum(p * F.conv2d(p * w, self.kernel, padding=self.radius))
+            den = torch.sum(p * F.conv2d(w, self.kernel, padding=self.radius)) + 1e-6
+            total = total + num / den                          # association in [0,1]
+
+        # maximise association => minimise (n_classes - association)
+        return n_classes - total
+
+
+class StormSegLossV2(nn.Module):
+    """Phase 2 loss: four independent binary heads, no mutual exclusivity.
+
+    Per class:  BCEWithLogits(pos_weight) + Tversky.
+
+    Tversky replaces Dice because Dice weights false positives and false
+    negatives equally, which is wrong for targets this rare — a hurricane eye is
+    ~0.3% of the globe, so predicting nothing scores well. beta > alpha penalises
+    missed positives harder and pushes recall up.
+
+    Gone from StormSegLoss / ARSegmentationLoss:
+      * the softmax and the pairwise overlap penalty — ARs and ETCs co-occur, and
+        penalising that was penalising the correct answer
+      * the logit(clamp(probs)) round-trip — this takes logits directly
+
+    N-cut and reconstruction are added by the training loop, not here, so their
+    weights can be scheduled independently.
+
+    Args:
+        class_weight   : per-class scale, ordered (AR, Hurricane, ETC, MCS)
+        tversky_alpha  : false-positive penalty
+        tversky_beta   : false-negative penalty (> alpha for rare classes)
+        max_pos_weight : cap on the per-batch neg/pos ratio in the BCE, so a
+                         nearly empty batch cannot produce a huge gradient
+    """
+
+    def __init__(self,
+                 class_weight=(1.0, 3.0, 2.0, 1.5),
+                 target_threshold: float = 0.5,
+                 tversky_alpha=0.3,
+                 tversky_beta=0.7,
+                 tversky_weight: float = 1.0,
+                 use_pos_weight: bool = True,
+                 max_pos_weight=50.0,
+                 valid_mask=None):
+        super().__init__()
+        # valid_mask: None (default, unchanged behaviour) or a (H,W) / (C,H,W)
+        # boolean-ish tensor. Pixels outside it are excluded from BOTH the BCE mean
+        # and the Tversky sums. RegCM needs this because ~29% of every frame is
+        # outside the model domain, and the Hurricane head additionally has no label
+        # west of -105 deg (TempestExtremes never searched there) — undefined, not
+        # negative. Scoring those pixels as negatives would teach the model that
+        # visible storms are not storms.
+        self._valid_mask = None
+        if valid_mask is not None:
+            import torch as _t
+            vm = _t.as_tensor(valid_mask).float()
+            if vm.dim() == 2:
+                vm = vm.unsqueeze(0)
+            self.register_buffer("_vm", vm, persistent=False)
+            self._valid_mask = True
+        self.class_names = ["ar", "hurricane", "etc", "mcs"]
+        n = len(self.class_names)
+
+        def _per_class(v, what):
+            """Accept a scalar (shared by every class) or one value per class."""
+            if isinstance(v, (int, float)):
+                return [float(v)] * n
+            v = list(v)
+            if len(v) != n:
+                raise ValueError(f"{what} needs 1 or {n} values, got {len(v)}")
+            return [float(x) for x in v]
+
+        self.class_weight = _per_class(class_weight, "class_weight")
+        self.target_threshold = target_threshold
+        # Per-class alpha/beta/pos_weight, because the base rates span an order
+        # of magnitude: AR covers ~6.8% of the globe, a hurricane eye ~0.3%.
+        # The Phase 2 pilot showed a single recall push that suits hurricanes
+        # drives AR to recall 0.99 at precision 0.55 — and for a class whose
+        # optimal decision is a crisp threshold, that over-prediction costs IoU
+        # directly (AR landed below its own single-threshold baseline).
+        self.alpha = _per_class(tversky_alpha, "tversky_alpha")
+        self.beta = _per_class(tversky_beta, "tversky_beta")
+        self.max_pos_weight = _per_class(max_pos_weight, "max_pos_weight")
+        self.tversky_weight = tversky_weight
+        self.use_pos_weight = use_pos_weight
+
+    def _tversky(self, probs, target, alpha, beta, smooth=1e-6, w=None):
+        if w is not None:
+            probs = probs * w
+            target = target * w
+        tp = (probs * target).sum()
+        fp = (probs * (1 - target)).sum()
+        fn = ((1 - probs) * target).sum()
+        ti = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+        return 1.0 - ti
+
+    def forward(self, logits, labels):
+        """logits: (B,4,H,W) pre-sigmoid. labels: (B,4,H,W) heuristic masks."""
+        if logits.shape[1] != 4 or labels.shape[1] != 4:
+            raise ValueError(f"expected 4 channels, got logits {logits.shape[1]} "
+                             f"labels {labels.shape[1]}")
+        logits = logits.float()
+        labels = labels.float()
+
+        out = {}
+        total = logits.new_zeros(())
+        for i, name in enumerate(self.class_names):
+            lg = logits[:, i]
+            target = (labels[:, i] > self.target_threshold).float()
+
+            pos_weight = None
+            if self.use_pos_weight:
+                if self._valid_mask is None:
+                    n_pos = target.sum()
+                    n_tot = target.numel()
+                else:
+                    _w = (self._vm[i] if self._vm.shape[0] > 1 else self._vm[0])
+                    _w = _w.to(target.device, target.dtype)
+                    n_pos = (target * _w).sum()
+                    n_tot = _w.sum() * target.shape[0]
+                if n_pos > 0:
+                    n_neg = n_tot - n_pos
+                    pos_weight = torch.clamp(n_neg / n_pos, min=1.0,
+                                             max=self.max_pos_weight[i])
+
+            if self._valid_mask is None:
+                bce = F.binary_cross_entropy_with_logits(
+                    lg, target, pos_weight=pos_weight, reduction="mean")
+                tv = self._tversky(torch.sigmoid(lg), target,
+                                   self.alpha[i], self.beta[i])
+            else:
+                w = self._vm[i] if self._vm.shape[0] > 1 else self._vm[0]
+                w = w.to(lg.device, lg.dtype)
+                bce_px = F.binary_cross_entropy_with_logits(
+                    lg, target, pos_weight=pos_weight, reduction="none")
+                bce = (bce_px * w).sum() / w.sum().clamp(min=1.0) / max(lg.shape[0], 1)
+                tv = self._tversky(torch.sigmoid(lg), target,
+                                   self.alpha[i], self.beta[i], w=w)
+
+            loss_c = self.class_weight[i] * (bce + self.tversky_weight * tv)
+            out[f"{name}_loss"] = loss_c.detach()
+            total = total + loss_c
+
+        out["total_loss"] = total
+        return out

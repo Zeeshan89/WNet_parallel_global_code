@@ -47,165 +47,6 @@ def calculate_ivt(test_new_ar):
 
     return test_new_ar
 
-
-def open_wnet_dataset(path):
-    """
-    Open a RegCM regridded WNet file and normalise its time to a STANDARD
-    (datetime64) calendar.
-
-    RegCM CMIP runs use different calendars: ACC/CNR/MPI/MRI are gregorian, but
-    BCC and NOR use a 365-day (noleap) calendar → xarray decodes their time as
-    cftime.DatetimeNoLeap. That breaks (a) pd.Timestamp(...) used for IBTrACS keys
-    and (b) time alignment/merge with the BT files (which are datetime64). Convert
-    noleap → standard (align_on='date' just relabels existing steps; no Feb-29 is
-    ever present in noleap data, so nothing is added/dropped). Gregorian files are
-    a no-op.
-    """
-    import xarray as xr
-    ds = xr.open_dataset(path)
-    if 'time' in ds.coords or 'time' in ds.dims:
-        try:
-            ds = ds.convert_calendar('standard', align_on='date')
-        except Exception as e:
-            print(f"[open_wnet_dataset] calendar normalise skipped for {path}: {e}")
-    return ds
-
-
-def regcm_checkpoint_dir(model=None):
-    """THE single source of truth for the RegCM checkpoint directory.
-
-    main.py (final_checkpoint, loss_history) and train.py (ema_checkpoint_epoch_*)
-    both write checkpoints. They used to hardcode this path SEPARATELY, and the two
-    copies drifted: main.py was repointed to the precip-MCS run while train.py kept
-    writing ema_checkpoint_epoch_*.pth into the BT-era Trail_RegCM_<MODEL>/, silently
-    overwriting the A/B baseline. Import this from both instead of re-deriving it.
-
-    `Trail_RegCM_PR_<MODEL>`  — precipitation-based MCS (current).
-    `Trail_RegCM_<MODEL>`     — the BT-era baseline: the verified AR/Hurricane/ETC
-                                weights and the only reference to A/B against.
-                                Never write there.
-    """
-    m = model or os.environ.get("REGCM_MODEL", "ACC")
-    return ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
-            "Storms_precipitation_notebooks/WNet_parallel_global_RegCM/"
-            f"ARs_Hurricanes_ETCs_MCS/Trail_RegCM_PR_{m}")
-
-
-def load_regcm_global_stats(model, gs_dir):
-    """
-    Read RegCM per-model normalization stats from the CDO-produced .txt files in
-    <gs_dir> (e.g. ACC_IVT_mean.txt, ACC_IVT_std.txt, …). Returns a dict shaped
-    exactly like the legacy hardcoded ERA5 `global_stats`, so it is a drop-in
-    replacement in main.py / precompute_tensors.py.
-
-    Keys IVT/MSLP/IWV/BT/vorticity/wind_speed match dataset.py::_compute_statistics.
-    temp_500mb is omitted (absent in RegCM → zero-filled; only feeds the inert
-    hurricane warm-core filter). BT is included (MCS re-enabled).
-    """
-    def rd(name):
-        with open(os.path.join(gs_dir, f"{model}_{name}.txt")) as fh:
-            return float(fh.read().split()[0])
-
-    return {
-        k: {"mean": rd(f"{k}_mean"), "std": rd(f"{k}_std")}
-        for k in ["IVT", "MSLP", "IWV", "BT", "vorticity", "wind_speed"]
-    }
-
-
-def load_regcm_bt_thresholds(model, gs_dir, default=(241.0, 225.0), prefer_2d=True):
-    """
-    Per-model MCS brightness-temperature thresholds (shield/core), computed by
-    compute_bt_thresholds.py. The fixed 241/225 K literals are calibrated for ERA5
-    satellite Tb, but the RegCM cloud-top-temperature proxy is a different field
-    whose cold bias is LATITUDE-DEPENDENT (~0 K in the tropics, ~15 K at 40-45 N).
-
-    Resolution order per threshold:
-      1. <MODEL>_BT_{boundary,core}_2d.nc — a per-CELL 2-D field matched to ERA5's
-         per-cell cold-cloud frequency. PREFERRED: a single scalar cannot serve both
-         the tropics and the continental mid-latitudes (a domain-wide scalar skews
-         detection ~2x toward the tropics and starves the Great Plains).
-      2. <MODEL>_BT_{boundary,core}.txt — domain-wide scalar (legacy fallback).
-      3. the ERA5 literals (so the ERA5 pipeline is unaffected).
-
-    Returns {'BT_boundary': <2-D DataArray | float>, 'BT_core': <2-D DataArray | float>}.
-    dataset.py accepts either (see _as_threshold); `bt <= thr` broadcasts over (lat, lon).
-    """
-    def rd(name, fallback):
-        if prefer_2d:
-            p2 = os.path.join(gs_dir, f"{model}_{name}_2d.nc")
-            if os.path.exists(p2):
-                try:
-                    return load_percentile_dataset(p2)
-                except Exception as e:
-                    print(f"[load_regcm_bt_thresholds] {p2} unreadable ({e}) → trying scalar")
-        p = os.path.join(gs_dir, f"{model}_{name}.txt")
-        try:
-            with open(p) as fh:
-                return float(fh.read().split()[0])
-        except (OSError, ValueError):
-            print(f"[load_regcm_bt_thresholds] {p} missing → using ERA5 literal {fallback}")
-            return float(fallback)
-
-    return {"BT_boundary": rd("BT_boundary", default[0]),
-            "BT_core":     rd("BT_core",     default[1])}
-
-
-def load_regcm_pr_thresholds(model, gs_dir, default=(0.1, 1.0, 0.7), prefer_2d=True):
-    """
-    MCS precipitation thresholds: convective-precip shield / core / convective
-    fraction, all in mm/h except the dimensionless fraction. Returns
-    {'PR_shield': …, 'PR_core': …, 'PR_convfrac': …}; dataset.py accepts a scalar
-    or a 2-D field (see _as_threshold) and `prc >= thr` broadcasts over (lat, lon).
-
-    THESE ARE FIXED PHYSICAL CONSTANTS BY DESIGN — there is deliberately no
-    compute_pr_thresholds.py analogue of compute_bt_thresholds.py. Please read
-    this before "improving" it into a per-cell calibration:
-
-      * compute_bt_thresholds.py frequency-matches per-cell against ERA5 because
-        RegCM's `T_cloud_top` is a *proxy*, not a measurement, with a
-        latitude-dependent cold bias (~0 K tropics, ~15 K at 40-45 N) that is a
-        pure artifact of the diagnostic. There, matching is bias-correcting an
-        artifact, and it is justified.
-      * `pr`/`prc` are real prognostic variables. 1.0 mm/h means the same thing
-        in RegCM, in ERA5 and at a rain gauge — there is no instrument-vs-
-        diagnostic mismatch to correct.
-      * Per-cell ERA5 frequency-matching would be CIRCULAR: it imposes ERA5's
-        spatial pattern on the detector by construction, and the model is then
-        evaluated against ERA5. The known PNW/Cascades excess would vanish not
-        because it was fixed but because it was defined away.
-      * Fixed thresholds keep the six-model comparison meaningful. Six per-model
-        threshold fields would make inter-model differences calibration residue.
-
-    Defaults (validated on ACC 1990/1995/2000, 6-hourly, area >= 60,000 km^2):
-      shield prc >= 0.1 mm/h AND convective fraction >= 0.7; core prc >= 1.0 mm/h
-      → Great Plains 21.8, Midwest 23.4, Southeast 34.2 MCS days/yr, with the
-      correct seasonality (Great Plains DJF 0.2 vs JJA 12.3) — the thing the
-      brightness-temperature branch could never reproduce.
-
-    The 2-D lookup is wired but unused: an override file only exists if someone
-    deliberately creates one, and the resolution order keeps that option free.
-    """
-    def rd(name, fallback):
-        if prefer_2d:
-            p2 = os.path.join(gs_dir, f"{model}_{name}_2d.nc")
-            if os.path.exists(p2):
-                try:
-                    return load_percentile_dataset(p2)
-                except Exception as e:
-                    print(f"[load_regcm_pr_thresholds] {p2} unreadable ({e}) → trying scalar")
-        p = os.path.join(gs_dir, f"{model}_{name}.txt")
-        if os.path.exists(p):
-            try:
-                with open(p) as fh:
-                    return float(fh.read().split()[0])
-            except (OSError, ValueError):
-                print(f"[load_regcm_pr_thresholds] {p} unreadable → using default {fallback}")
-        return float(fallback)
-
-    return {"PR_shield":   rd("PR_shield",   default[0]),
-            "PR_core":     rd("PR_core",     default[1]),
-            "PR_convfrac": rd("PR_convfrac", default[2])}
-
 # --- Helper Functions ---
 def print_memory_usage():
     """Print current memory usage"""
@@ -413,11 +254,7 @@ def load_percentile_dataset(path, rank=0, lat_name="lat", lon_name="lon"):
         if lon_key in ds.coords:
             ds = ds.assign_coords({lon_key: ((ds[lon_key] + 180) % 360) - 180}).sortby(lon_key)
 
-    # Detect the main variable.
-    # NOTE: RegCM CDO outputs name the fields vorticity / wind_speed / IWV / MSLP
-    # and also carry a leading `time_bnds` (datetime) variable — the old fallback
-    # `list(ds.data_vars)[0]` grabbed `time_bnds`, producing a garbage (all-zero)
-    # threshold. Recognise the RegCM names explicitly and skip bounds vars.
+    # Detect the main variable
     if "IVT" in ds:
         var = ds["IVT"]
     elif "ivt" in ds:
@@ -426,25 +263,14 @@ def load_percentile_dataset(path, rank=0, lat_name="lat", lon_name="lon"):
         var = ds["TPR"]
     elif "wspd" in ds:
         var = ds["wspd"]
-    elif "wind_speed" in ds:
-        var = ds["wind_speed"]
     elif "var138" in ds:
         var = ds["var138"]
-    elif "vorticity" in ds:
-        var = ds["vorticity"]
     elif "bt" in ds:
         var = ds["bt"]
     elif "MSLP" in ds:
         var = ds["MSLP"]
-    elif "IWV" in ds:
-        var = ds["IWV"]
     else:
-        # Fallback: first real field, skipping coordinate-bounds variables.
-        _skip = ("time_bnds", "lon_bnds", "lat_bnds", "longitude_bnds",
-                 "latitude_bnds", "time_bounds", "bnds")
-        candidates = [v for v in ds.data_vars
-                      if v not in _skip and ds[v].ndim >= 2]
-        main_var = candidates[0] if candidates else list(ds.data_vars)[0]
+        main_var = list(ds.data_vars)[0]
         var = ds[main_var]
         if rank == 0:
             print(f"Using {main_var} as threshold variable from {path}")

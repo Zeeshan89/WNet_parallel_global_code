@@ -36,52 +36,36 @@ except Exception:
     world_size = int(os.environ.get("SLURM_NTASKS", 1))
     comm = None
 
-# ── RegCM model selection ──────────────────────────────────────────────────────
-# One code copy serves all six RegCM-CMIP6 runs; pick via the REGCM_MODEL env var
-# (export REGCM_MODEL=ACC before launching). Also drives cache_loader's filename.
-MODEL      = os.environ.get("REGCM_MODEL", "ACC")
-REGCM_BASE = "/lustre/orion/cli138/proj-shared/dr6/eventtype/Data/RegCM-CMIP6/Data-processed"
-GS_DIR     = f"{REGCM_BASE}/{MODEL}/global_stats"
-
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DATA_DIR        = f"{REGCM_BASE}/{MODEL}/WNet_6hourly_latlon/"
-# Fresh, per-model HDF5 cache dir (kept EMPTY on purpose → forces the RegCM-aware
-# NetCDF fallback in cache_loader; must NOT point at the shared ERA5 cache).
-CACHE_DIR       = f"../Percentile_ARs_detection/cache/preprocessed_RegCM_{MODEL}"
+DATA_DIR        = "/lustre/orion/cli138/proj-shared/z7a/Storms_data/data/"
+CACHE_DIR       = "../Percentile_ARs_detection/cache/preprocessed_v3"
 
-# Precip-MCS tensors live in their OWN dir, separate from the BT-branch cache
-# (tensor_cache_RegCM_<MODEL>), which stays intact as the A/B baseline.
-# MUST stay in sync with dataset.ARDatasetImproved.TENSOR_CACHE_DIR.
-TENSOR_DIR      = (f"/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/tensor_cache_RegCM_PR_{MODEL}")
+TENSOR_DIR      = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/tensor_cache_v2")
 
-VOR850_PATH     = f"{GS_DIR}/{MODEL}_vor850_75th.nc"
-WINDSPEED_PATH  = f"{GS_DIR}/{MODEL}_windspeed850_75th.nc"
-MSLP_CLIM_PATH  = f"{GS_DIR}/{MODEL}_mslp_monthly_climatology.nc"
+VOR850_PATH     = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                   "vor850_latlongrid/vor850_latlongrid/output/"
+                   "vor850_75th_percentile_global.nc")
+WINDSPEED_PATH  = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                   "wind_speed_850/output/windspeed850_75th_percentile_global.nc")
+MSLP_CLIM_PATH  = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                   "data/global_stats/mslp_monthly_climatology.nc")
 IBTRACS_PATH    = ("/lustre/orion/proj-shared/cli138/dr6/eventtype/run-tracking/"
                    "StormType-Data/TCs/ibtracs/IBTrACS.ALL.v04r01.nc")
 
-# RegCM provides vorticity & wind_speed INLINE in the regridded file (read by
-# cache_loader); no separate aux dirs, and no temp500/shear. BT IS available.
-VORTICITY_DIR   = None
-WIND_SPEED_FILE = None
-TEMP_500MB_DIR  = None
-WINDSHEAR_DIR   = None
-BRIGHT_TEMP_DIR = f"{REGCM_BASE}/{MODEL}/BT_6hourly_latlon"
-# Precipitation for the MCS branch: yearly files carrying `pr` and `prc` in mm/h,
-# produced by Run_PR_regrid.sh (mirrors the BT dir layout).
-PRECIP_DIR      = f"{REGCM_BASE}/{MODEL}/PR_6hourly_latlon"
-IWV_CLIM_PATH   = f"{GS_DIR}/{MODEL}_iwv_monthly_climatology.nc"
+VORTICITY_DIR   = ("/lustre/orion/cli138/proj-shared/z7a/Storms_data/"
+                   "vor850_latlongrid/vor850_latlongrid/")
+WIND_SPEED_FILE = ("/lustre/orion/cli138/proj-shared/z7a/Storms_data/"
+                   "wind_speed_850/ERA5_windspeed_850mb_6hourly_final.nc")
+TEMP_500MB_DIR  = ("/lustre/orion/proj-shared/cli138/dr6/eventtype/Data/ERA5/"
+                   "GLOBAL/from-ncar-server/t/monthly_output/6_hourly")
+WINDSHEAR_DIR   = ("/lustre/orion/cli138/proj-shared/z7a/Storms_data/"
+                   "wind_shear_mag_sqrtu_v/")
+BRIGHT_TEMP_DIR = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                   "OLR/brightness_temp_new/")
 
 TARGET_SIZE  = (192, 384)
 START_YEAR   = 1980
-END_YEAR     = 2014
-
-# Per-model normalization stats + MCS BT thresholds (read once from .txt files).
-from utils import (load_regcm_global_stats, load_regcm_bt_thresholds,
-                   load_regcm_pr_thresholds)
-_REGCM_STATS = load_regcm_global_stats(MODEL, GS_DIR)
-_REGCM_BT    = load_regcm_bt_thresholds(MODEL, GS_DIR)   # legacy BT A/B path only
-_REGCM_PR    = load_regcm_pr_thresholds(MODEL, GS_DIR)   # MCS shield/core precip rates
+END_YEAR     = 2024
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,14 +89,15 @@ def _parse_date_str(nc_file):
     return date_str, int(date_str[:4]), int(date_str[4:6])
 
 
-def file_already_cached(nc_file, tensor_dir):
-    """Check if .npy tensor cache already exists for this file."""
+def file_already_cached(nc_file, tensor_dir, split=False):
+    """Check if the .npy tensor cache already exists for this file."""
     try:
         date_str, _, _ = _parse_date_str(nc_file)
     except ValueError:
         return False
-    npy_path  = os.path.join(tensor_dir, f"tensors_{date_str}.npy")
-    meta_path = os.path.join(tensor_dir, f"tensors_{date_str}.meta.npy")
+    prefix = "split" if split else "tensors"
+    npy_path  = os.path.join(tensor_dir, f"{prefix}_{date_str}.npy")
+    meta_path = os.path.join(tensor_dir, f"{prefix}_{date_str}.meta.npy")
     return os.path.exists(npy_path) and os.path.exists(meta_path)
 
 
@@ -127,70 +112,6 @@ def _barrier():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_aux_data(year, month, vorticity_files, wind_speed_full):
-    """
-    RegCM: `vorticity` and `wind_speed` are read INLINE from the regridded main
-    file inside cache_loader. `temp_500mb` / `windhshear_ds` do not exist → None.
-    `BT_ds` IS available — yearly file `<MODEL>_bt_6hourly_{year}.nc`, var `bt`,
-    sliced to this month (clear-sky NaN filled later in preprocess_data_improved).
-    `PR_ds` (vars `pr`, `prc`, mm/h) drives the precipitation-based MCS branch —
-    yearly file `<MODEL>_pr_6hourly_{year}.nc`, sliced the same way.
-    """
-    import xarray as xr
-    from utils import open_wnet_dataset
-
-    aux = {
-        "temp_500mb":    None,
-        "windhshear_ds": None,
-        "vorticity":     None,   # cache_loader pulls it from the main file
-        "wind_speed":    None,   # cache_loader pulls it from the main file
-        "BT_ds":         None,
-        "PR_ds":         None,
-    }
-
-    bt_file = os.path.join(BRIGHT_TEMP_DIR, f"{MODEL}_bt_6hourly_{year:04d}.nc")
-    if os.path.exists(bt_file):
-        try:
-            bt_ds = xr.open_dataset(bt_file)
-            if "valid_time" in bt_ds.dims:
-                bt_ds = bt_ds.rename({"valid_time": "time"})
-            last_day = calendar.monthrange(year, month)[1]
-            aux["BT_ds"] = bt_ds.sel(
-                time=slice(f"{year:04d}-{month:02d}-01",
-                           f"{year:04d}-{month:02d}-{last_day:02d}")
-            )
-        except Exception as e:
-            print(f"  [WARN] BT load failed: {e}")
-            aux["BT_ds"] = None
-    else:
-        print(f"  [WARN] BT file missing: {bt_file}")
-
-    # ── Precipitation (pr / prc, mm/h) — MCS source ───────────────────────────
-    # open_wnet_dataset (not plain xr.open_dataset): BCC and NOR are noleap in
-    # the precip files too, and cftime vs datetime64 would break the time
-    # alignment against the main file in preprocess_data_improved.
-    pr_file = os.path.join(PRECIP_DIR, f"{MODEL}_pr_6hourly_{year:04d}.nc")
-    if os.path.exists(pr_file):
-        try:
-            pr_ds = open_wnet_dataset(pr_file)
-            last_day = calendar.monthrange(year, month)[1]
-            aux["PR_ds"] = pr_ds.sel(
-                time=slice(f"{year:04d}-{month:02d}-01",
-                           f"{year:04d}-{month:02d}-{last_day:02d}")
-            )
-            if aux["PR_ds"].sizes.get("time", 0) == 0:
-                print(f"  [WARN] PR slice empty for {year:04d}-{month:02d}")
-                aux["PR_ds"] = None
-        except Exception as e:
-            print(f"  [WARN] PR load failed: {e}")
-            aux["PR_ds"] = None
-    else:
-        # Expected for 198001 only (RegCM SRF output starts 1980-02).
-        print(f"  [WARN] PR file missing: {pr_file}")
-
-    return aux
-
-
-def _load_aux_data_ERA5_UNUSED(year, month, vorticity_files, wind_speed_full):
     """
     Load per-month auxiliary data: temp_500mb, BT, wind shear, vorticity.
     Returns a dict with keys matching cache_loader.load_data() kwarg names.
@@ -315,12 +236,17 @@ def precompute_one_file(
     nc_file, tensor_dir,
     vor850_per, windspeed_per, mslp_clim, ibtracs_lookup,
     vorticity_files, wind_speed_full,
-    rank,
-    iwv_clim=None,
+    rank, split=False,
 ):
     """
     Load one monthly file, run ARDatasetImproved precompute,
     save tensors to disk.
+
+    split=False : legacy (N, 14, H, W) tensors — input and target entangled.
+    split=True  : Phase 1 (N, 10, H, W) tensors — 6 RAW physical predictors
+                  followed by the 4 heuristic label masks. Reuses an existing
+                  legacy month for the masks when one is present, which makes
+                  this seconds per month instead of ~23 minutes.
 
     Returns (date_str, n_samples, elapsed_seconds) or None on error.
     """
@@ -335,8 +261,9 @@ def precompute_one_file(
         print(f"  [ERROR] Rank {rank}: {e}")
         return None
 
-    npy_path  = os.path.join(tensor_dir, f"tensors_{date_str}.npy")
-    meta_path = os.path.join(tensor_dir, f"tensors_{date_str}.meta.npy")
+    prefix = "split" if split else "tensors"
+    npy_path  = os.path.join(tensor_dir, f"{prefix}_{date_str}.npy")
+    meta_path = os.path.join(tensor_dir, f"{prefix}_{date_str}.meta.npy")
 
     # ── Skip if already cached ────────────────────────────────────────────────
     if os.path.exists(npy_path) and os.path.exists(meta_path):
@@ -348,17 +275,6 @@ def precompute_one_file(
     try:
         # ── Load auxiliary data for this month ────────────────────────────────
         aux = _load_aux_data(year, month, vorticity_files, wind_speed_full=None)
-
-        # ── CRITICAL-AUX GATE: precipitation drives the MCS branch ────────────
-        # Without this, a missing PR file zero-fills → `prc >= threshold` is
-        # false everywhere → all-zero MCS targets → the model silently learns
-        # "MCS never happens". Skip the month loudly instead.
-        # Expected to fire for 198001 only (RegCM SRF output starts 1980-02).
-        if aux["PR_ds"] is None:
-            print(f"  [SKIP] Rank {rank}: {nc_file} — no precipitation data "
-                  f"({year:04d}-{month:02d}); MCS channels would be all-zero.")
-            return None
-
         # ── Load from HDF5 cache / NetCDF fallback (same as main.py) ──────────
         cache_loader = CacheAwareDataLoader(cache_dir=CACHE_DIR)
 
@@ -373,7 +289,6 @@ def precompute_one_file(
             wind_speed=aux["wind_speed"],
             temp_500mb=aux["temp_500mb"],
             BT_ds=aux["BT_ds"],
-            PR_ds=aux["PR_ds"],
             windhshear_ds=aux["windhshear_ds"],
             ivt_percentile=400,
         )
@@ -398,12 +313,10 @@ def precompute_one_file(
                     time_values = np.array(str_times, dtype="datetime64[s]")
             except Exception:
                 file_path = os.path.join(DATA_DIR, nc_file)
-                from utils import open_wnet_dataset
-                time_values = open_wnet_dataset(file_path)["time"].values
+                time_values = xr.open_dataset(file_path)["time"].values
         else:
             file_path = os.path.join(DATA_DIR, nc_file)
-            from utils import open_wnet_dataset
-            time_values = open_wnet_dataset(file_path)["time"].values
+            time_values = xr.open_dataset(file_path)["time"].values
 
         # ── Reconstruct lat / lon ─────────────────────────────────────────────
         if ("latitude" in preprocessed_data
@@ -441,6 +354,30 @@ def precompute_one_file(
                     coords=coords_dict,
                 )
 
+        # ── Raw IVT for the split predictor stack ─────────────────────────────
+        # The preprocessed cache's `ivt` was built with ivt_percentile=400, so
+        # it is zeroed below that and has IoU 0.917 with the AR label — using it
+        # as a model input would re-create the Phase 0 copy shortcut. Recompute
+        # the true field from the source Qu/Qv, matching the cache's longitude
+        # roll (-180..180, sorted) so it lands on the same grid.
+        if split:
+            src = xr.open_dataset(os.path.join(DATA_DIR, nc_file))
+            src = src.assign_coords(
+                longitude=(((src.longitude + 180) % 360) - 180)).sortby('longitude')
+            ivt_raw = np.sqrt(src['Qu'].values ** 2 + src['Qv'].values ** 2
+                              ).astype(np.float32)
+            src.close()
+            if ivt_raw.shape != ERA5_6hrly_ARs['ivt'].shape:
+                raise ValueError(
+                    f"raw IVT shape {ivt_raw.shape} != cached ivt shape "
+                    f"{ERA5_6hrly_ARs['ivt'].shape} for {nc_file}")
+            ERA5_6hrly_ARs['ivt_raw'] = xr.DataArray(
+                ivt_raw, dims=["time", "latitude", "longitude"],
+                coords=ERA5_6hrly_ARs['ivt'].coords)
+            print(f"  [split] raw IVT from Qu/Qv: "
+                  f"{100*(ivt_raw == 0).mean():.2f}% zeros "
+                  f"(cached ivt is {100*(ERA5_6hrly_ARs['ivt'].values == 0).mean():.2f}%)")
+
         # ── IBTrACS slice for this month ──────────────────────────────────────
         era5_6h_keys = [
             pd.Timestamp(t).to_pydatetime().replace(
@@ -459,19 +396,21 @@ def precompute_one_file(
         global_percentiles = {
             "vor850":            vor850_per,
             "windspeed":         windspeed_per,
-            "BT_boundary":       _REGCM_BT["BT_boundary"],   # per-model (was ERA5 241.0)
-            "BT_core":           _REGCM_BT["BT_core"],       # per-model (was ERA5 225.0)
-            # MCS is precipitation-based; BT_* above only feed the legacy
-            # mcs_source="bt" A/B path.
-            "PR_shield":         _REGCM_PR["PR_shield"],     # mm/h, convective
-            "PR_core":           _REGCM_PR["PR_core"],       # mm/h, convective
-            "PR_convfrac":       _REGCM_PR["PR_convfrac"],   # prc/pr, dimensionless
+            "BT_boundary":       241.0,
+            "BT_core":           225.0,
             "Temp500":           270.0,
             "vor850_per_hurr":   1.45e-5,
             "windspeed_per_hurr": 8.0,
         }
-        # RegCM per-model stats loaded from the CDO .txt files (Steps 1–3).
-        global_stats = _REGCM_STATS
+        global_stats = {
+            "IVT":        {"mean": 170.566,      "std": 11.6209},
+            "IWV":        {"mean": 24.1535,      "std": 1.12097},
+            "BT":         {"mean": 254.675,      "std": 0.648636},
+            "MSLP":       {"mean": 101138.0,     "std": 15.6262},
+            "vorticity":  {"mean": -4.09177e-10, "std": 4.02875e-05},
+            "wind_speed": {"mean": 8.35723,      "std": 0.306227},
+            "temp_500mb": {"mean": 258.428,      "std": 0.832617},
+        }
 
         # ── Build dataset — precompute=True runs the expensive part ───────────
         # Pass year/month so the dataset's own caching logic is consistent,
@@ -486,17 +425,22 @@ def precompute_one_file(
             global_stats=global_stats,
             precompute=True,
             mslp_climatology=mslp_clim,
-            iwv_climatology=iwv_clim,            # MCS moisture anomaly gate
-            mcs_moisture_mode="anomaly",
             ibtracs_lookup=ibtracs_this_month,
             year=year,
             month=month,
+            output_mode=("split" if split else "legacy"),
         )
 
         # ── Save tensors to the requested tensor_dir ──────────────────────────
+        # legacy: (N, 14, H, W)   split: (N, 10, H, W) = 6 raw predictors + 4 labels
+        # In split mode the dataset already saved to its own SPLIT_CACHE_DIR, so
+        # only write again when tensor_dir points somewhere else — a redundant
+        # 366 MB rewrite per month is real I/O on Lustre.
         os.makedirs(tensor_dir, exist_ok=True)
-        np.save(npy_path,  dataset.precomputed_data)   # (N, 14, H, W) float32 (MCS on)
-        np.save(meta_path, time_values)                # time axis metadata
+        already_saved = split and os.path.exists(npy_path)
+        if not already_saved:
+            np.save(npy_path,  dataset.precomputed_data)
+            np.save(meta_path, time_values)            # time axis metadata
 
         elapsed  = time.time() - t0
         n_samples = len(dataset)
@@ -534,21 +478,25 @@ def main():
     )
     parser.add_argument("--start_year", type=int, default=START_YEAR)
     parser.add_argument("--end_year",   type=int, default=END_YEAR)
-    # Month bounds apply to the FIRST and LAST year respectively, so
-    # --start_year 2000 --end_year 2000 --start_month 7 --end_month 7 is one file.
-    # Used by the single-month smoke test; the full run leaves them at 1/12.
-    parser.add_argument("--start_month", type=int, default=1, choices=range(1, 13),
-                        metavar="1-12", help="First month of start_year (default 1)")
-    parser.add_argument("--end_month",   type=int, default=12, choices=range(1, 13),
-                        metavar="1-12", help="Last month of end_year (default 12)")
-    parser.add_argument("--tensor_dir", type=str, default=TENSOR_DIR)
+    parser.add_argument("--tensor_dir", type=str, default=None,
+                        help="Output dir (defaults to the legacy or split cache "
+                             "depending on --split)")
     parser.add_argument(
         "--overwrite", action="store_true",
         help="Re-compute even if .npy cache already exists",
     )
+    parser.add_argument(
+        "--split", action="store_true",
+        help="Build the Phase 1 split cache: (N, 10, H, W) = 6 RAW physical "
+             "predictors + 4 label masks, instead of the legacy 14-channel "
+             "tensors where inputs and targets were entangled. Reuses existing "
+             "legacy months for the masks, so it runs in seconds per month.",
+    )
     args = parser.parse_args()
 
-    tensor_dir = args.tensor_dir
+    from dataset import ARDatasetImproved
+    tensor_dir = args.tensor_dir or (
+        ARDatasetImproved.SPLIT_CACHE_DIR if args.split else TENSOR_DIR)
 
     if rank == 0:
         print(f"\n{'='*60}")
@@ -556,6 +504,7 @@ def main():
         print(f"{'='*60}")
         print(f"  World size : {world_size} ranks")
         print(f"  Year range : {args.start_year}–{args.end_year}")
+        print(f"  Mode       : {'SPLIT (6 predictors + 4 labels)' if args.split else 'legacy (14 ch)'}")
         print(f"  Output dir : {tensor_dir}")
         print(f"  Overwrite  : {args.overwrite}")
         print(f"{'='*60}\n")
@@ -574,17 +523,16 @@ def main():
     vor850_per    = load_percentile_dataset(VOR850_PATH,    rank)
     windspeed_per = load_percentile_dataset(WINDSPEED_PATH, rank)
     mslp_clim     = load_percentile_dataset(MSLP_CLIM_PATH, rank)
-    iwv_clim      = (load_percentile_dataset(IWV_CLIM_PATH, rank)
-                     if os.path.exists(IWV_CLIM_PATH) else None)
-    if rank == 0 and iwv_clim is None:
-        print(f"⚠ IWV climatology missing at {IWV_CLIM_PATH} — MCS uses absolute-IWV gate")
 
-    # RegCM: wind_speed and vorticity are read INLINE from the main regridded file
-    # inside cache_loader, so there is no separate WIND_SPEED_FILE / VORTICITY_DIR.
-    # _load_aux_data ignores both of these, so leave them empty (the ERA5 code that
-    # opened them is dead here and crashed because the paths are None).
-    wind_speed_full = None
-    vorticity_files = []
+    # Full wind speed dataset — sliced per-month inside _load_aux_data
+    wind_speed_full = xr.open_dataset(WIND_SPEED_FILE).squeeze("level")
+    wind_speed_full = wind_speed_full.assign_coords(
+        longitude=(((wind_speed_full.longitude + 180) % 360) - 180)
+    ).sortby("longitude")
+
+    vorticity_files = sorted(glob.glob(
+        os.path.join(VORTICITY_DIR, "ERA5_vor_6hourly_*.850mb_latlon.nc")
+    ))
 
     ibtracs_lookup = load_ibtracs_for_training(
         IBTRACS_PATH,
@@ -604,14 +552,13 @@ def main():
     def _in_range(fname):
         try:
             _, y, m = _parse_date_str(fname)
-            return ((args.start_year, args.start_month) <= (y, m)
-                    <= (args.end_year, args.end_month))
+            return (args.start_year, 1) <= (y, m) <= (args.end_year, 12)
         except ValueError:
             return False
 
     all_files = sorted([
         f for f in os.listdir(DATA_DIR)
-        if f.startswith(f"{MODEL}dara_") and f.endswith(".nc") and _in_range(f)
+        if f.startswith("era5dara_") and f.endswith(".nc") and _in_range(f)
     ])
 
     if rank == 0:
@@ -627,7 +574,7 @@ def main():
     # Optionally filter out already-cached files
     if not args.overwrite:
         pending = [f for f in my_files
-                   if not file_already_cached(f, tensor_dir)]
+                   if not file_already_cached(f, tensor_dir, split=args.split)]
         skipped_upfront = len(my_files) - len(pending)
         if skipped_upfront > 0:
             print(f"[Rank {rank}] Skipping {skipped_upfront} already-cached "
@@ -658,7 +605,7 @@ def main():
             vorticity_files=vorticity_files,
             wind_speed_full=wind_speed_full,
             rank=rank,
-            iwv_clim=iwv_clim,
+            split=args.split,
         )
 
         if result is not None:

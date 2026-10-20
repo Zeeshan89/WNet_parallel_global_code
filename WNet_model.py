@@ -105,7 +105,7 @@ class ImprovedUNet(nn.Module):
         return x
 
 class ImprovedWNet(nn.Module):
-    def __init__(self, in_channels, num_classes=5):  # RegCM: 5 classes (MCS on)
+    def __init__(self, in_channels, num_classes=5):
         super().__init__()
         self.unet1 = ImprovedUNet(in_channels, num_classes)
         self.unet2 = ImprovedUNet(num_classes, in_channels)
@@ -120,3 +120,70 @@ class ImprovedWNet(nn.Module):
 
         return seg_probs, rec
     
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2 — multi-label W-Net
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class WNetMultiLabel(nn.Module):
+    """W-Net with four INDEPENDENT binary heads and a discretised bottleneck.
+
+    Two changes from ImprovedWNet, both forced by measurements:
+
+    1. No softmax. ImprovedWNet made the four storm classes mutually exclusive
+       and ARSegmentationLoss added an explicit overlap penalty on top. ARs
+       genuinely overlap ETC warm conveyor belts, so that construction penalised
+       the physically correct answer. Here each class gets its own sigmoid and a
+       pixel may belong to several — background is simply "no head fired".
+
+    2. The code handed to the decoder is DISCRETISED by default. Phase 0 showed
+       the old bottleneck did not bind: reconstruction of continuous IVT scored
+       0.996 from the soft softmax but only 0.369 once that softmax was replaced
+       by its own argmax one-hot. The sub-1% residual probability mass was acting
+       as a full-resolution real-valued side channel, so the reconstruction term
+       exerted no pressure on the segmentation at all. A straight-through
+       estimator makes the forward pass genuinely binary (4 bits per pixel) while
+       still passing gradients, so reconstruction finally costs something.
+
+    Args:
+        in_channels : physical predictor count (6 for the Phase 1 contract)
+        num_classes : storm classes, one binary head each (4)
+        discretize  : 'ste'  hard 0/1 forward, soft gradient (default)
+                      'soft' raw sigmoids, i.e. the leaky Phase 0 behaviour;
+                             kept only so the ablation can be run
+    """
+
+    def __init__(self, in_channels=6, num_classes=4, discretize='ste'):
+        super().__init__()
+        if discretize not in ('ste', 'soft'):
+            raise ValueError(f"discretize must be 'ste' or 'soft', got {discretize!r}")
+        self.num_classes = num_classes
+        self.discretize = discretize
+        self.unet1 = ImprovedUNet(in_channels, num_classes)
+        self.unet2 = ImprovedUNet(num_classes, in_channels)
+
+    def encode(self, x):
+        """Segmentation only — logits and per-class probabilities."""
+        logits = self.unet1(x)
+        return logits, torch.sigmoid(logits)
+
+    def bottleneck_code(self, probs):
+        if self.discretize == 'soft':
+            return probs
+        # Straight-through: forward value is exactly 0/1, gradient is d(probs).
+        hard = (probs > 0.5).to(probs.dtype)
+        return probs + (hard - probs).detach()
+
+    def forward(self, x):
+        """Returns (probs, rec, logits).
+
+        probs  : (B, num_classes, H, W) independent per-class probabilities
+        rec    : (B, in_channels,  H, W) reconstruction of the physical fields
+        logits : (B, num_classes, H, W) pre-sigmoid, so the loss can use
+                 BCEWithLogits directly instead of a lossy logit(clamp(p))
+                 round-trip through probability space
+        """
+        logits, probs = self.encode(x)
+        rec = self.unet2(self.bottleneck_code(probs))
+        return probs, rec, logits
