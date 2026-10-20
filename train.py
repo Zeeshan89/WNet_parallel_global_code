@@ -29,13 +29,25 @@ import gc
 import time
 from torch_ema import ExponentialMovingAverage
 
-from loss import ARSegmentationLoss, clear_gpu_cache
+from loss import ARSegmentationLoss, StormSegLoss, clear_gpu_cache
 from utils import print_memory_usage
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
 from itertools import cycle, islice
+
+
+def _repeat(loader):
+    """Endless pass over a DataLoader WITHOUT itertools.cycle's copy of every batch.
+
+    cycle() stores each element of its first pass so it can replay them; for a DataLoader that pins
+    every batch of the epoch in (shared) memory. Harmless at 192x384 (~3 GB per rank), fatal at
+    0.25 deg (83 MB batches, ~34 GB per rank: /dev/shm exhausted at the end of epoch 1).
+    """
+    while True:
+        for b in loader:
+            yield b
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -70,6 +82,7 @@ def train_wnet_improved(
     ema=None,           # ← passed in from main so it persists across files
     file_idx=0,              # ← NEW: which file are we on (0-indexed)
     global_epoch_offset=0,   # ← NEW: total epochs already trained before this file
+    split=False,             # ← Phase 1: loader yields (predictors, labels)
 ):
     """
     Training loop for one monthly file (called once per file per rank).
@@ -89,7 +102,11 @@ def train_wnet_improved(
     is_main_process = rank == 0
 
     # Loss functions
-    ar_loss  = ARSegmentationLoss().to(device)
+    # split=True  -> StormSegLoss reads targets from a separate label tensor, so
+    #                the model cannot satisfy it by copying an input channel.
+    # split=False -> legacy ARSegmentationLoss, which pulls its targets out of
+    #                the input itself (the Phase 0 shortcut).
+    ar_loss  = (StormSegLoss() if split else ARSegmentationLoss()).to(device)
     rec_loss = nn.MSELoss().to(device)
 
     # Create EMA locally only if not provided (single-file / non-persistent use)
@@ -154,7 +171,7 @@ def train_wnet_improved(
             optimizer.zero_grad()
 
             # REPLACE WITH this one line:
-            for batch_idx, batch in enumerate(islice(cycle(train_loader), max_batches)):
+            for batch_idx, batch in enumerate(islice(_repeat(train_loader), max_batches)):
 
                 _epoch_data_time += time.time() - _t_data
                 _t_fwd = time.time()
@@ -163,19 +180,30 @@ def train_wnet_improved(
                 if torch.cuda.is_available() and batch_idx % 10 == 0:
                     torch.cuda.empty_cache()
 
-                batch = batch.to(device, non_blocking=True)
+                # Split contract: the loader yields (predictors, labels). `x` is
+                # all the model ever sees; `y` goes only to the loss.
+                if split:
+                    x, y = batch
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                else:
+                    x = batch.to(device, non_blocking=True)
+                    y = x            # legacy: targets live inside the input
                 batch_start_time = time.time()
 
                 # ── Forward + loss ────────────────────────────────────────────
                 if scaler is not None:
                     with autocast():
-                        seg_probs, rec = model(batch)
+                        seg_probs, rec = model(x)
                         _epoch_forward_time += time.time() - _t_fwd
                         _t_bwd = time.time()
 
-                        loss_dict          = ar_loss(seg_probs, batch)
+                        loss_dict          = ar_loss(seg_probs, y)
                         segmentation_loss  = loss_dict["total_loss"]
-                        reconstruction_loss = rec_loss(rec, batch)
+                        # Reconstruct the PHYSICAL fields. In split mode this is a
+                        # real bottleneck objective; in legacy mode 13 of the 14
+                        # channels were masks the decoder could pass straight through.
+                        reconstruction_loss = rec_loss(rec, x)
 
                         rec_weight, seg_weight = _dynamic_weights(epoch, warmup_epochs, global_epoch_offset)
 
@@ -189,13 +217,13 @@ def train_wnet_improved(
                     _t_opt = time.time()
 
                 else:
-                    seg_probs, rec = model(batch)
+                    seg_probs, rec = model(x)
                     _epoch_forward_time += time.time() - _t_fwd
                     _t_bwd = time.time()
 
-                    loss_dict           = ar_loss(seg_probs, batch)
+                    loss_dict           = ar_loss(seg_probs, y)
                     segmentation_loss   = loss_dict["total_loss"]
-                    reconstruction_loss = rec_loss(rec, batch)
+                    reconstruction_loss = rec_loss(rec, x)
 
                     rec_weight, seg_weight = _dynamic_weights(epoch, warmup_epochs, global_epoch_offset)
                     total_loss = (
@@ -261,7 +289,7 @@ def train_wnet_improved(
                     print_memory_usage()
                     clear_gpu_cache()
 
-                del batch, seg_probs, rec, segmentation_loss, reconstruction_loss, total_loss
+                del batch, x, y, seg_probs, rec, segmentation_loss, reconstruction_loss, total_loss
 
             # ── End of epoch ──────────────────────────────────────────────────
             n = batch_count if batch_count > 0 else 1
@@ -360,6 +388,7 @@ def validate_on_loader(
     accumulator,
     use_amp: bool = True,
     rank: int = 0,
+    split: bool = False,
 ):
     """
     Forward-only validation pass — runs only UNet1 (segmentation head),
@@ -380,19 +409,25 @@ def validate_on_loader(
     try:
         with torch.no_grad():
             for batch in val_loader:
-                batch = batch.to(device, non_blocking=True)
+                if split:
+                    x, y = batch
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                else:
+                    x = batch.to(device, non_blocking=True)
+                    y = x
                 if use_amp and torch.cuda.is_available():
                     with autocast():
-                        seg_logits = seg_net(batch)
+                        seg_logits = seg_net(x)
                         seg_probs  = F.softmax(seg_logits, dim=1)
                 else:
-                    seg_logits = seg_net(batch)
+                    seg_logits = seg_net(x)
                     seg_probs  = F.softmax(seg_logits, dim=1)
 
-                accumulator.update(seg_probs, batch)
+                accumulator.update(seg_probs, y, split=split)
                 n_batches += 1
 
-                del batch, seg_logits, seg_probs
+                del batch, x, y, seg_logits, seg_probs
     finally:
         if was_training:
             model.train()
@@ -553,3 +588,312 @@ def run_zombie_training(model, optimizer, scheduler, device, num_epochs,
 
         # ── 5. Mirror: epoch-end barrier ──────────────────────────────────────
         dist.barrier()
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 2 — multi-label training
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Held-out years. Consecutive 6-hourly frames are near-duplicates, so a random
+# frame split leaks the test set into training and every score comes out
+# flattering. Splitting by YEAR is the cheapest honest option. These are spread
+# across the record rather than taken from one end, so neither split is a single
+# climate epoch, and they include both ENSO phases.
+VAL_YEARS  = (1987, 1998, 2007, 2016)
+TEST_YEARS = (1983, 1994, 2003, 2012, 2021)
+
+
+def split_years(start_year=1980, end_year=2024):
+    """Return (train_years, val_years, test_years) as sorted lists."""
+    allx = list(range(start_year, end_year + 1))
+    val = [y for y in allx if y in VAL_YEARS]
+    test = [y for y in allx if y in TEST_YEARS]
+    train = [y for y in allx if y not in VAL_YEARS and y not in TEST_YEARS]
+    return train, val, test
+
+
+def year_of_file(name):
+    """Extract YYYY from era5dara_YYYYMM.nc / split_YYYYMM.npy style names."""
+    import re
+    m = re.search(r"(\d{4})(\d{2})", os.path.basename(str(name)))
+    return int(m.group(1)) if m else None
+
+
+def filter_files_by_years(files, years):
+    years = set(years)
+    return [f for f in files if year_of_file(f) in years]
+
+
+def train_wnet_multilabel(
+    model, train_loader, optimizer, scheduler, device,
+    num_epochs=3,
+    gradient_accumulation_steps=4,
+    scaler=None,
+    distributed=False,
+    rank=0,
+    world_size=1,
+    ema=None,
+    global_epoch_offset=0,
+    seg_loss=None,
+    ncut_loss=None,
+    ncut_weight=0.1,
+    rec_weight_fn=None,
+):
+    """Training loop for WNetMultiLabel on the Phase 1 split contract.
+
+    Differences from train_wnet_improved that made a separate loop cleaner than
+    another flag: the model returns (probs, rec, logits) rather than
+    (seg_probs, rec); the loss consumes LOGITS not probabilities; and there is an
+    N-cut term which needs the predictors as well as the predictions.
+
+    total = seg_weight * segmentation + rec_weight * reconstruction
+            + ncut_weight * ncut
+    """
+    from loss import StormSegLossV2, NCutLoss2DFixed
+
+    model.train()
+    is_distributed = distributed and world_size > 1
+    is_main = rank == 0
+
+    seg_loss = (seg_loss or StormSegLossV2()).to(device)
+    ncut_loss = ncut_loss if ncut_loss is not None else NCutLoss2DFixed().to(device)
+    rec_criterion = nn.MSELoss().to(device)
+    rec_weight_fn = rec_weight_fn or (lambda e: _dynamic_weights(e, 5, global_epoch_offset))
+
+    if scaler is None and torch.cuda.is_available():
+        scaler = GradScaler()
+
+    _local_ema = ema is None
+    if _local_ema:
+        ema = ExponentialMovingAverage(model.parameters(), decay=0.995)
+
+    if is_distributed:
+        nb = torch.tensor(len(train_loader), dtype=torch.int32, device=device)
+        dist.all_reduce(nb, op=dist.ReduceOp.MAX)
+        max_batches = int(nb.item())
+        if max_batches > 10000 or max_batches <= 0:
+            max_batches = len(train_loader)
+    else:
+        max_batches = len(train_loader)
+
+    losses = []
+    details = {"ar": [], "hurricane": [], "etc": [], "mcs": [],
+               "ncut": [], "rec": [], "total": []}
+
+    for epoch in range(num_epochs):
+        acc = {k: 0.0 for k in ("total", "ar", "hurricane", "etc", "mcs", "ncut", "rec")}
+        n_batches = 0
+        optimizer.zero_grad()
+        t_epoch = time.time()
+
+        for batch_idx, batch in enumerate(islice(_repeat(train_loader), max_batches)):
+            if torch.cuda.is_available() and batch_idx % 10 == 0:
+                torch.cuda.empty_cache()
+
+            x, y = batch
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            rec_w, seg_w = rec_weight_fn(epoch)
+
+            if scaler is not None:
+                with autocast():
+                    probs, rec, logits = model(x)
+                    ld = seg_loss(logits, y)
+                    seg_term = ld["total_loss"]
+                    rec_term = rec_criterion(rec, x)
+                    ncut_term = (ncut_loss(probs, x) if ncut_weight > 0
+                                 else probs.new_zeros(()))
+                    total = (seg_w * seg_term + rec_w * rec_term
+                             + ncut_weight * ncut_term) / gradient_accumulation_steps
+                scaler.scale(total).backward()
+            else:
+                probs, rec, logits = model(x)
+                ld = seg_loss(logits, y)
+                seg_term = ld["total_loss"]
+                rec_term = rec_criterion(rec, x)
+                ncut_term = (ncut_loss(probs, x) if ncut_weight > 0
+                             else probs.new_zeros(()))
+                total = (seg_w * seg_term + rec_w * rec_term
+                         + ncut_weight * ncut_term) / gradient_accumulation_steps
+                total.backward()
+
+            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                ema.update()
+                optimizer.zero_grad()
+
+            acc["total"] += float(total.detach().cpu()) * gradient_accumulation_steps
+            acc["rec"] += float(rec_term.detach().cpu())
+            acc["ncut"] += float(ncut_term.detach().cpu())
+            for c in ("ar", "hurricane", "etc", "mcs"):
+                acc[c] += float(ld[f"{c}_loss"].cpu())
+            n_batches += 1
+
+            if is_main and batch_idx % 20 == 0:
+                print(f"  ep {epoch+1}/{num_epochs} b {batch_idx}/{max_batches} | "
+                      f"tot {acc['total']/max(n_batches,1):.4f} | "
+                      f"seg {float(seg_term.detach().cpu()):.4f} | "
+                      f"rec {float(rec_term.detach().cpu()):.4f} | "
+                      f"ncut {float(ncut_term.detach().cpu()):.4f} | "
+                      f"w(seg {seg_w:.2f} rec {rec_w:.2f})")
+
+            del batch, x, y, probs, rec, logits, seg_term, rec_term, ncut_term, total
+
+        n = max(n_batches, 1)
+        avg = {k: v / n for k, v in acc.items()}
+
+        if is_distributed:
+            t = torch.tensor([avg[k] for k in ("total", "ar", "hurricane",
+                                               "etc", "mcs", "ncut", "rec")],
+                             device=device)
+            t = reduce_tensor(t, world_size)
+            for i, k in enumerate(("total", "ar", "hurricane", "etc",
+                                   "mcs", "ncut", "rec")):
+                avg[k] = float(t[i].cpu())
+
+        losses.append(avg["total"])
+        for k in details:
+            details[k].append(avg[k])
+
+        if scheduler:
+            scheduler.step()
+
+        if is_main:
+            print(f"  Epoch {epoch+1}/{num_epochs} done | total={avg['total']:.6f} "
+                  f"| AR {avg['ar']:.4f} Hurr {avg['hurricane']:.4f} "
+                  f"ETC {avg['etc']:.4f} MCS {avg['mcs']:.4f} "
+                  f"| rec {avg['rec']:.4f} ncut {avg['ncut']:.4f} "
+                  f"| {time.time()-t_epoch:.0f}s")
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if is_distributed:
+            dist.barrier()
+
+    return losses, details
+
+
+@torch.no_grad()
+def validate_multilabel(model, val_loader, device, accumulator,
+                        use_amp=True, rank=0):
+    """Forward-only validation for WNetMultiLabel — segmentation head only."""
+    inner = model.module if hasattr(model, "module") else model
+    was_training = model.training
+    model.eval()
+    n = 0
+    try:
+        for batch in val_loader:
+            x, y = batch
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            if use_amp and torch.cuda.is_available():
+                with autocast():
+                    _, probs = inner.encode(x)
+            else:
+                _, probs = inner.encode(x)
+            accumulator.update(probs.float(), y, multilabel=True)
+            n += 1
+            del batch, x, y, probs
+    finally:
+        if was_training:
+            model.train()
+    return n
+
+
+def load_init_weights(model, init_path, device=None, allow_partial=False,
+                      verbose=True):
+    """Initialise `model` from a checkpoint, reporting what actually matched.
+
+    Transfer, not resume: model weights only, no optimizer/scheduler/EMA/epoch.
+
+    WHY THIS RECONCILES KEYS INSTEAD OF JUST CALLING load_state_dict(strict=True)
+    ---------------------------------------------------------------------------
+    The RegCM loader printed only `len(state)` and relied on strict=True to catch
+    problems. That is not a verification. `ImprovedWNet(14, 5)` and
+    `WNetMultiLabel(6, 4)` BOTH have exactly 228 tensors and identical key names —
+    only 6 of the 228 differ in shape — so a tensor count is the same number for
+    the right architecture and the wrong one. A silent partial load is likewise
+    indistinguishable from a successful fine-tune unless the keys are compared.
+
+    Returns a dict recorded into the run config so history.json proves which arm
+    produced a checkpoint.
+    """
+    import torch as _t
+
+    ckpt = _t.load(init_path, map_location=device or "cpu", weights_only=False)
+    state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    # Checkpoints written from a DDP-wrapped model carry a "module." prefix.
+    state = {k[len("module."):] if k.startswith("module.") else k: v
+             for k, v in state.items()}
+
+    tgt = model.state_dict()
+    matched, shape_mismatch = [], []
+    for k, v in state.items():
+        if k in tgt:
+            (matched if tuple(tgt[k].shape) == tuple(v.shape)
+             else shape_mismatch).append(k)
+    missing = [k for k in tgt if k not in state]
+    unexpected = [k for k in state if k not in tgt]
+
+    loadable = {k: state[k] for k in matched}
+    model.load_state_dict(loadable, strict=False)
+
+    report = {
+        "init_weights": str(init_path),
+        "init_matched": len(matched),
+        "init_total_model_tensors": len(tgt),
+        "init_shape_mismatch": len(shape_mismatch),
+        "init_missing": len(missing),
+        "init_unexpected": len(unexpected),
+        "init_src_epoch": (ckpt.get("epoch") if isinstance(ckpt, dict) else None),
+        "init_src_skill": (ckpt.get("val_skill_vs_baseline")
+                           if isinstance(ckpt, dict) else None),
+    }
+
+    if verbose:
+        print(f"  [init-weights] {init_path}")
+        print(f"    matched        : {len(matched)}/{len(tgt)}")
+        print(f"    shape mismatch : {len(shape_mismatch)}  {shape_mismatch[:10]}")
+        print(f"    missing        : {len(missing)}  {missing[:10]}")
+        print(f"    unexpected     : {len(unexpected)}  {unexpected[:10]}")
+        print(f"    source epoch   : {report['init_src_epoch']}  "
+              f"skill {report['init_src_skill']}")
+
+    if not matched:
+        raise SystemExit(
+            f"--init-weights {init_path}: ZERO tensors matched. The checkpoint does "
+            f"not correspond to this architecture; refusing to 'fine-tune' from a "
+            f"random initialisation while reporting success.")
+    # ANY shape mismatch is fatal, and a match FRACTION is not a sufficient guard.
+    # Measured: loading the ERA5 WNetMultiLabel(6,4) checkpoint into a (14,5) model
+    # matches 222/228 = 97.4% — comfortably past any sane percentage gate — while
+    # the 6 skipped tensors are exactly unet1.enc1.double_conv.0.weight,
+    # unet1.dec1.{weight,bias} and their unet2 counterparts: the input projection
+    # and the output heads. Those would stay randomly initialised and the run would
+    # still look like a successful fine-tune. Mismatched shapes mean the
+    # architectures differ; refuse unless that is stated explicitly.
+    if shape_mismatch and not allow_partial:
+        raise SystemExit(
+            f"--init-weights {init_path}: {len(shape_mismatch)} tensor(s) have the "
+            f"right NAME but the wrong SHAPE, so the architectures differ:\n    "
+            + "\n    ".join(f"{k}: ckpt {tuple(state[k].shape)} vs model "
+                            f"{tuple(tgt[k].shape)}" for k in shape_mismatch[:8])
+            + "\n  These are typically the input projection and the output heads — "
+              "loading around them leaves exactly the layers that define the task "
+              "randomly initialised. Pass --allow-partial-init only if deliberate.")
+
+    frac = len(matched) / max(len(tgt), 1)
+    if frac < 0.95 and not allow_partial:
+        raise SystemExit(
+            f"--init-weights {init_path}: only {len(matched)}/{len(tgt)} tensors "
+            f"({100*frac:.1f}%) matched. Pass --allow-partial-init if that is "
+            f"deliberate.")
+    return report

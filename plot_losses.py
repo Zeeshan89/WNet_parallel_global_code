@@ -2,6 +2,7 @@
 Comprehensive Loss Visualization Script
 Updated for new loss_history.pkl format (single dict with all files concatenated)
 """
+import argparse
 import os
 import pickle
 import numpy as np
@@ -651,6 +652,285 @@ def plot_train_loss_vs_val_iou(history):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Plot 10 — Data-ordering diagnostic (why the train loss oscillates)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The era blocks are ORDINAL — successive ~6-year slices of the record — so they
+# get a single-hue sequential ramp (light→dark), not categorical hues. Keeping
+# them blue also keeps them clear of the per-class colours reused in panel (c).
+# Lightness is monotone (OKLCH L 0.72 → 0.50 → 0.32); all-pairs CVD ΔE ≥ 16.7.
+ERA_RAMP = ["#6baed6", "#2171b5", "#08306b"]
+
+_INK        = "#1a1a19"   # primary text
+_INK_MUTED  = "#52514e"   # secondary text
+_ASRUN_GREY = "#9a9a95"   # recessive "as run" trace in panel (b)
+
+
+def _block_spans(history):
+    """
+    Return [(start_epoch, end_epoch, rank0_label), …] — one entry per file block.
+    """
+    boundaries = history.get("file_boundaries", [])
+    file_names = history.get("file_names", [])
+    n = len(history["total"])
+    spans = []
+    for i, b_start in enumerate(boundaries):
+        b_end = boundaries[i + 1] if i + 1 < len(boundaries) else n
+        label = _file_label(file_names[i]) if i < len(file_names) else str(i)
+        spans.append((b_start, b_end, label))
+    return spans
+
+
+def _era_groups(history):
+    """
+    Group epochs by which slot of the pass they came from.
+
+    Every rank owns a fixed set of monthly files and all ranks step through
+    their slots in lockstep, so the slot index *is* the ~6-year block of the
+    record the whole job is training on. Rank 0's file label appears exactly
+    once per pass, so grouping by that label is identical to grouping by slot.
+    get_rank_files() slices a chronologically sorted list, so sorting the labels
+    recovers the chronological slot order.
+
+    Returns (labels, {label: [epoch indices]}).
+    """
+    spans = _block_spans(history)
+    if not spans:
+        return [], {}
+    labels = sorted({lab for _, _, lab in spans})
+    groups = {lab: [] for lab in labels}
+    for b_start, b_end, lab in spans:
+        groups[lab].extend(range(b_start, b_end))
+    return labels, groups
+
+
+def _era_year_spans(labels, world_size=64, start_year=2006, end_year=2024,
+                    data_dir="/lustre/orion/proj-shared/cli138/z7a/Storms_data/data"):
+    """
+    Human-readable year span of each block, e.g. '2006-2012'.
+
+    A block is shared by *all* ranks at that slot, so its span covers every
+    rank's slot-k file — not just rank 0's single month. Reconstructs the
+    sharding with the same functions main.py used, and only returns spans if
+    rank 0's reconstructed files reproduce the labels actually recorded in the
+    history. Any mismatch (different world size, year range, data dir) returns
+    {} and the caller falls back to bare YYYYMM labels.
+    """
+    try:
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from distributed_dataset import build_train_val_split, get_rank_files
+
+        all_files = sorted(
+            f for f in os.listdir(data_dir)
+            if f.startswith("era5dara_") and f.endswith(".nc")
+            and start_year <= int(f.split("_")[1][:4]) <= end_year
+        )
+        train_files, _ = build_train_val_split(all_files, val_fraction=0.135, seed=42)
+
+        per_rank = [get_rank_files(train_files, r, world_size, shuffle=False)
+                    for r in range(world_size)]
+        rank0 = per_rank[0]
+        if sorted(_file_label(f) for f in rank0) != sorted(labels):
+            print("  [era spans] reconstructed sharding does not match the recorded "
+                  "file labels — falling back to YYYYMM labels")
+            return {}
+
+        spans = {}
+        for slot, f0 in enumerate(rank0):
+            years = [int(files[slot].split("_")[1][:4])
+                     for files in per_rank if slot < len(files)]
+            spans[_file_label(f0)] = f"{min(years)}–{max(years)}"
+        return spans
+    except Exception as e:
+        print(f"  [era spans] could not reconstruct sharding ({type(e).__name__}: {e}) "
+              f"— falling back to YYYYMM labels")
+        return {}
+
+
+def _eta_squared(values, groups, burn):
+    """
+    Fraction of epoch-to-epoch variance in `values` explained by block identity
+    (one-way ANOVA eta-squared, SSB / SST), over epochs >= burn.
+    """
+    per_group = [np.asarray([values[e] for e in eps if e >= burn], dtype=float)
+                 for eps in groups.values()]
+    per_group = [g for g in per_group if g.size > 0]
+    pooled = np.concatenate(per_group) if per_group else np.array([])
+    if pooled.size < 2:
+        return np.nan
+    grand = pooled.mean()
+    ssb = sum(g.size * (g.mean() - grand) ** 2 for g in per_group)
+    ssw = sum(((g - g.mean()) ** 2).sum() for g in per_group)
+    return ssb / (ssb + ssw) if (ssb + ssw) > 0 else np.nan
+
+
+def plot_data_ordering_diagnostic(history, focus="mcs", focus_label="MCS",
+                                  focus_color="forestgreen", world_size=64):
+    """
+    Why the train loss oscillates: it tracks which ~6-year block of the record
+    the job is training on, not optimiser instability.
+
+    (a) as run — the loss steps in lockstep with the block cycle
+    (b) the same losses at composition-complete (pass) scale — the cycle is gone
+    (c) how much of each class's epoch-to-epoch variance the block identity explains
+
+    Panel (b) is a RE-AGGREGATION of the recorded per-epoch losses at the
+    composition cross-month pooling would enforce. It is not a second training
+    run: it establishes that the oscillation is composition, not optimisation.
+    """
+    values = np.asarray(history.get(focus, []), dtype=float)
+    labels, groups = _era_groups(history)
+    if values.size == 0 or len(labels) < 2:
+        print("Not enough file-block structure in history — skipping data-ordering plot")
+        return
+
+    epochs_per_file = _epochs_per_file(history)
+    epochs_per_pass = len(labels) * epochs_per_file
+    burn            = 2 * epochs_per_pass          # drop warm-up passes
+    n               = values.size
+    if n <= burn + epochs_per_pass:
+        print("Too few epochs after warm-up — skipping data-ordering plot")
+        return
+
+    year_spans  = _era_year_spans(labels, world_size=world_size)
+    era_color   = {lab: ERA_RAMP[i % len(ERA_RAMP)] for i, lab in enumerate(labels)}
+    era_text    = {lab: year_spans.get(lab, lab) for lab in labels}
+    block_means = {lab: np.mean([values[e] for e in groups[lab] if e >= burn])
+                   for lab in labels}
+
+    # Pass-scale re-aggregation: whole passes only, starting on a pass boundary.
+    n_pass   = (n - burn) // epochs_per_pass
+    tail     = burn + n_pass * epochs_per_pass
+    passes   = values[burn:tail].reshape(n_pass, epochs_per_pass).mean(axis=1)
+    pass_x   = burn + (np.arange(n_pass) + 0.5) * epochs_per_pass
+
+    post     = values[burn:]
+    p2p_run  = post.max() - post.min()
+    p2p_pass = passes.max() - passes.min()
+    eta2     = _eta_squared(values, groups, burn)
+    sd_btw   = np.std(list(block_means.values()))
+    sd_wtn   = np.sqrt(np.mean([
+        np.var([values[e] for e in groups[lab] if e >= burn]) for lab in labels
+    ]))
+
+    # Panel (a) zooms the final few passes, where every block has settled onto a
+    # flat plateau, so the step-per-block correspondence is exact rather than
+    # tangled up with the early decline.
+    zoom_passes = min(3, n_pass)
+    zoom_lo     = tail - zoom_passes * epochs_per_pass
+    zoom_hi     = tail
+
+    fig = plt.figure(figsize=(18, 5.6))
+    gs  = fig.add_gridspec(1, 3, width_ratios=[1.25, 1.35, 0.75],
+                           left=0.045, right=0.99, bottom=0.30, top=0.90, wspace=0.26)
+    ax_a, ax_b, ax_c = (fig.add_subplot(gs[0, i]) for i in range(3))
+    for ax in (ax_a, ax_b, ax_c):            # white ground so the sequential ramp reads
+        ax.set_facecolor("white")
+        ax.grid(True, color="#e3e3e0", linewidth=0.8)
+        ax.set_axisbelow(True)
+
+    # ── (a) as run, zoomed ───────────────────────────────────────────────────
+    zoom_v    = values[zoom_lo:zoom_hi]
+    zrange    = zoom_v.max() - zoom_v.min()
+    ylim_a    = (zoom_v.min() - 0.10 * zrange, zoom_v.max() + 0.26 * zrange)
+    zoom_mean = {lab: np.mean([values[e] for e in groups[lab]
+                               if zoom_lo <= e < zoom_hi]) for lab in labels}
+
+    for b_start, b_end, lab in _block_spans(history):
+        if b_end <= zoom_lo or b_start >= zoom_hi:
+            continue
+        ax_a.axvspan(max(b_start, zoom_lo), min(b_end, zoom_hi),
+                     color=era_color[lab], alpha=0.45, zorder=0, lw=0)
+
+    # Direct labels live in a right-hand gutter aligned with each block's mean,
+    # so identity is never colour-alone and nothing collides with the trace.
+    gutter = 0.30 * (zoom_hi - zoom_lo)
+    for lab in labels:
+        ax_a.axhline(zoom_mean[lab], color=era_color[lab], linestyle="--",
+                     linewidth=1.3, alpha=0.85, zorder=2)
+        ax_a.text(zoom_hi + 0.06 * gutter, zoom_mean[lab], era_text[lab],
+                  fontsize=10, ha="left", va="center", color=era_color[lab],
+                  fontweight="bold", zorder=4)
+    ax_a.plot(np.arange(n), values, color=focus_color, linewidth=2.0, zorder=3)
+
+    ax_a.set_xlim(zoom_lo, zoom_hi + gutter)
+    ax_a.set_ylim(*ylim_a)
+    ax_a.axvspan(zoom_hi, zoom_hi + gutter, color="white", zorder=1, lw=0)
+    ax_a.set_xticks([t for t in ax_a.get_xticks() if zoom_lo <= t <= zoom_hi])
+    ax_a.set_xlabel(f"Global epoch (final {zoom_passes} passes)", fontsize=12, color=_INK)
+    ax_a.set_ylabel(f"{focus_label} train loss", fontsize=12, color=_INK)
+    ax_a.set_title("(a) As run — the loss level is set by the block",
+                   fontsize=13, fontweight="bold", color=_INK)
+    ax_a.text(0.03, 0.975,
+              "block order is re-permuted every pass — "
+              "the loss follows the block, not the position",
+              transform=ax_a.transAxes, fontsize=9.5, color=_INK_MUTED,
+              ha="left", va="top")
+
+    # ── (b) composition-complete ─────────────────────────────────────────────
+    brange = post.max() - post.min()
+    ylim_b = (post.min() - 0.06 * brange, post.max() + 0.24 * brange)   # headroom for the legend
+    ax_b.axvspan(zoom_lo, zoom_hi, color="#d9d9d4", alpha=0.55, zorder=0, lw=0)
+    ax_b.text((zoom_lo + zoom_hi) / 2, post.max() + 0.02 * brange, "shown in (a)",
+              fontsize=9.5, ha="center", va="bottom", color=_INK_MUTED, zorder=4)
+    ax_b.plot(np.arange(n), values, color=_ASRUN_GREY, linewidth=1.0,
+              alpha=0.95, zorder=2, label="As run (per epoch)")
+    ax_b.plot(pass_x, passes, color=focus_color, linewidth=2.2,
+              marker=CLASS_MARKERS.get(focus, "o"), markersize=8, zorder=3,
+              label="Pooled (per pass)")
+    ax_b.set_xlim(burn, n)
+    ax_b.set_ylim(*ylim_b)
+    ax_b.set_xlabel(f"Global epoch (warm-up passes 1–2 omitted)", fontsize=12, color=_INK)
+    ax_b.set_ylabel(f"{focus_label} train loss", fontsize=12, color=_INK)
+    ax_b.set_title("(b) Pooled across blocks — the cycle is gone",
+                   fontsize=13, fontweight="bold", color=_INK)
+    ax_b.legend(fontsize=10, loc="upper left", framealpha=0.95)
+    ax_b.text(0.985, 0.975,
+              f"peak-to-peak {p2p_run:.3f} → {p2p_pass:.3f} ({p2p_run / p2p_pass:.1f}×)\n"
+              f"{passes[0]:.3f} → {passes[-1]:.3f}, declining",
+              transform=ax_b.transAxes, fontsize=9.5, color=_INK,
+              ha="right", va="top")
+
+    # ── (c) eta-squared per class ────────────────────────────────────────────
+    cls_cfg = [("mcs", "MCS", "forestgreen"), ("hurricane", "Hurricane", "firebrick"),
+               ("ar", "AR", "steelblue"), ("total", "Total", "black"),
+               ("etc", "ETC", "darkorange")]
+    rows = [(lbl, _eta_squared(np.asarray(history[k], dtype=float), groups, burn), c)
+            for k, lbl, c in cls_cfg if history.get(k)]
+    rows.sort(key=lambda r: np.nan_to_num(r[1], nan=-1.0))
+
+    ypos = np.arange(len(rows))
+    ax_c.barh(ypos, [r[1] for r in rows], color=[r[2] for r in rows],
+              height=0.6, zorder=3)
+    for y, (_, val, _) in zip(ypos, rows):
+        ax_c.text(val + 0.025, y, f"{val:.3f}", va="center", fontsize=11, color=_INK)
+    ax_c.set_yticks(ypos)
+    ax_c.set_yticklabels([r[0] for r in rows], fontsize=12, color=_INK)
+    ax_c.set_xlim(0, 1.2)
+    ax_c.set_xticks([0, 0.5, 1.0])
+    ax_c.set_xlabel("Variance explained ($\\eta^2$)", fontsize=12, color=_INK)
+    ax_c.set_title("(c) Not just MCS", fontsize=13, fontweight="bold", color=_INK)
+    ax_c.text(0.97, 0.06,
+              f"{focus_label}: between-block $\\sigma$ {sd_btw:.3f}\n"
+              f"vs within-block $\\sigma$ {sd_wtn:.3f} ({sd_btw / sd_wtn:.0f}×)",
+              transform=ax_c.transAxes, fontsize=9.5, color=_INK_MUTED,
+              ha="right", va="bottom")
+
+    fig.text(0.5, 0.15,
+             "Each rank holds one monthly file from each of three ~6-year blocks of the record, and all "
+             "ranks step through their blocks in lockstep, so the era composition of\n"
+             "the global batch cycles with a period of one pass. Sample-level shuffling is already "
+             "enabled within each monthly file, so it cannot mix across the block\n"
+             "boundary where the loss steps — what is missing is cross-month pooling. Panel (b) "
+             "re-aggregates the same recorded per-epoch losses at the composition\n"
+             "that pooling across blocks would enforce; it is not a separate training run.",
+             ha="center", va="top", fontsize=10, color=_INK_MUTED, linespacing=1.6)
+
+    _save("data_ordering_not_instability")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Text report
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -737,9 +1017,33 @@ def create_summary_report(history):
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+def set_base_dir(base_dir):
+    """
+    Re-point the module at a different trial directory (e.g. to regenerate an
+    older run's plots without editing the BASE_DIR literal).
+    """
+    global BASE_DIR, HISTORY_PKL, OUTPUT_DIR
+    BASE_DIR    = base_dir
+    HISTORY_PKL = os.path.join(BASE_DIR, "loss_history.pkl")
+    OUTPUT_DIR  = os.path.join(BASE_DIR, "loss_plots")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
 def main():
-    print("Loading loss history …")
-    history = load_loss_history()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-dir", default=None,
+                        help="Trial directory holding loss_history.pkl "
+                             f"(default: {BASE_DIR})")
+    parser.add_argument("--world-size", type=int, default=64,
+                        help="DDP world size of the run, used to label era blocks "
+                             "in the data-ordering diagnostic (default: 64)")
+    args = parser.parse_args()
+
+    if args.base_dir:
+        set_base_dir(args.base_dir)
+
+    print(f"Loading loss history from {BASE_DIR} …")
+    history = load_loss_history(HISTORY_PKL)
     if history is None:
         return
 
@@ -753,6 +1057,7 @@ def main():
     plot_loss_statistics(history)
     plot_val_metrics(history)
     plot_train_loss_vs_val_iou(history)
+    plot_data_ordering_diagnostic(history, world_size=args.world_size)
 
     print("\nGenerating summary report …")
     create_summary_report(history)

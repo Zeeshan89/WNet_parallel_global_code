@@ -61,6 +61,23 @@ from distributed_dataset import get_rank_files
 # Set matplotlib backend for non-interactive environments
 matplotlib.use('Agg')
 
+# ── MCS-only inference (hourly run) ──────────────────────────────────────────
+# The hourly ERA5 evaluation has BT + TCWV only — no hourly IVT/MSLP/vorticity/
+# wind — so the AR/Hurricane/ETC input channels (0-10) cannot be built. With
+# MCS_ONLY=1 we zero them at the forward pass and keep ONLY the three MCS masks
+# (ch11-13, built from BT+moisture). The MCS segmentation class is driven by its
+# own input masks, so this leaves the MCS output ~unchanged — validated on
+# 6-hourly data before any hourly run (Phase 0). Env-gated: default (unset/0) is
+# the byte-for-byte 6-hourly pipeline. Channel order: dataset.py:436-448.
+MCS_ONLY = os.environ.get("MCS_ONLY", "0") == "1"
+
+
+def _apply_mcs_only(data):
+    """Zero the non-MCS input channels (0-10) in place when MCS_ONLY is set."""
+    if MCS_ONLY:
+        data[:, 0:11] = 0.0     # keep ch11 (boundary), ch12 (blobs), ch13 (core)
+    return data
+
 # Global variables
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 target_size = (360, 720)  # Default size, can be adjusted
@@ -337,9 +354,9 @@ def evaluate_and_save_results(model, dataset, era5_dataset, vorticity_data, wind
             
             # Get sample and model prediction
             sample = dataset[index]
-            data = sample.unsqueeze(0).to(device)
+            data = _apply_mcs_only(sample.unsqueeze(0).to(device))
             seg_probs, rec = model(data)
-            
+
             # Get original data for this timestep
             if isinstance(dataset, torch.utils.data.Subset):
                 actual_index = dataset.indices[index]
@@ -584,7 +601,8 @@ def evaluate_and_save_results(model, dataset, era5_dataset, vorticity_data, wind
     # OVERLAP-ONLY: no minimum-area criterion, no minimum-lifetime pruning.
     mcs_results, mcs_id_results = track_mcs_timeseries(
         mcs_results, lats, lons,
-        min_area_km2=None, link_overlap=0.5, min_lifetime_steps=1,
+        min_area_km2=None, link_overlap=0.5,
+        min_lifetime_steps=int(os.environ.get("MCS_MIN_LIFETIME_STEPS", "1")),
     )
 
     # Save results to NetCDF files
@@ -642,9 +660,9 @@ def visualize_segmentation_improved(model, dataset, era5_dataset, vorticity, win
         for i, index in enumerate(indices):
             try:
                 sample = dataset[index]
-                data = sample.unsqueeze(0).to(device)
+                data = _apply_mcs_only(sample.unsqueeze(0).to(device))
                 seg_probs, rec = model(data)
-                
+
                 if isinstance(dataset, torch.utils.data.Subset):
                     actual_index = dataset.indices[index]
                 else:
@@ -1066,7 +1084,8 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
     # Load SST data directory # era5_sst_1980.nc
     # SST_dir = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/sst/celsius/'
     # SST_files = sorted(glob.glob(os.path.join(SST_dir, 'era5_sst_*_6hourly_celsius.nc')))
-    Bright_temp = '/lustre/orion/proj-shared/cli138/z7a/Storms_data/OLR/brightness_temp_new/' 
+    Bright_temp = os.environ.get("BT_DIR",
+        '/lustre/orion/proj-shared/cli138/z7a/Storms_data/OLR/brightness_temp_new/')
     
     
     # Load vorticity data for hurricane detection
@@ -1083,7 +1102,13 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
     print("Loading wind speed data...")
     wind_speed_path = '/lustre/orion/cli138/proj-shared/z7a/Storms_data/wind_speed_850/ERA5_windspeed_850mb_6hourly_final.nc'
     
-    if os.path.exists(wind_speed_path):
+    if MCS_ONLY:
+        # ch2-10 (which use wind_speed) are zeroed at inference; the global load below
+        # sortby()'s the full 65748-step wind series into RAM (~93 GB/proc). Skipping it
+        # is a massive memory saving that lets many month-tasks share one node.
+        print("MCS_ONLY: skipping global wind_speed load (~93 GB) — ch2-10 are zeroed.")
+        wind_speed_full = None
+    elif os.path.exists(wind_speed_path):
         wind_speed_full = xr.open_dataset(wind_speed_path).squeeze('level')
         wind_speed_full = wind_speed_full.assign_coords(
             longitude=(((wind_speed_full.longitude + 180) % 360) - 180)
@@ -1139,8 +1164,9 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
         nc_files = []
         for f in all_nc_files:
             try:
-                file_year = int(f[9:13])  # Extract year from filename
-                file_month = int(f[13:15])  # e.g. "04"
+                _stem = f[:-3].split('_')[-1]  # YYYYMM from era5dara_YYYYMM.nc OR era5dara_hourly_YYYYMM.nc
+                file_year = int(_stem[:4])   # Extract year from filename
+                file_month = int(_stem[4:6])  # e.g. "04"
                 if start_year <= file_year <= end_year and start_month <= file_month <= end_month:
                     nc_files.append(f)
             except (ValueError, IndexError):
@@ -1212,7 +1238,7 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
             era5_dates = ERA5_6hrly_ARs['time'].values
             
             # Load matching 500mb temperature file
-            date_part = nc_file.split('_')[1].split('.')[0]  # Gets "201604" from "era5dara_201604.nc"
+            date_part = nc_file[:-3].split('_')[-1]  # YYYYMM, robust to era5dara_hourly_ infix
             year_part = date_part[:4]  # '2016'
             
             # ### SST data loading/reading
@@ -1230,18 +1256,21 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
             #     SST_ds = None
             
             ### BT data loading/reading
-            BT_file = os.path.join(Bright_temp, f'era5_bt_6hourly_{year_part}.nc')
+            BT_file = os.path.join(Bright_temp,
+                f'{os.environ.get("BT_PREFIX", "era5_bt_6hourly_")}{year_part}.nc')
             # print("sst_file",sst_file)
             if BT_file is not None:
-                BT_ds = xr.open_dataset(BT_file).rename({'valid_time':'time'})
+                BT_ds = xr.open_dataset(BT_file).rename({'valid_time':'time'})['bt']
+                # Subset to THIS file's timestamps BEFORE sortby('longitude'): the hourly BT
+                # is a full-year file (8760 steps ~36 GB); sorting it whole materialized ~90 GB
+                # /task and OOM-killed tasks. Selecting the month first (744 steps ~3 GB) then
+                # sorting keeps peak RAM small. sel(time) and sortby(lon) are independent dims,
+                # so the result is identical to the old order.
+                common_times = np.intersect1d(BT_ds.time.values, ERA5_6hrly_ARs.time.values)
+                BT_ds = BT_ds.sel(time=common_times)
                 BT_ds = BT_ds.assign_coords(
                     longitude=(((BT_ds.longitude + 180) % 360) - 180)
                 ).sortby('longitude')
-                
-                BT_ds = BT_ds['bt']
-                # BT_ds = BT_ds.sel(time=ERA5_6hrly_ARs['time'])
-                common_times = np.intersect1d(BT_ds.time.values, ERA5_6hrly_ARs.time.values)
-                BT_ds = BT_ds.sel(time=common_times)
 
             else:
                 print("No matching BT file found for this year.")
@@ -1308,8 +1337,10 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
 
             # Find and load vorticity data 850mb
             vorticity_file = find_matching_vorticity(era5_dates[0], vorticity_files)
-            
-            if vorticity_file is not None:
+
+            # MCS_ONLY (hourly): ch2-10 are zeroed at inference, and 6-hourly vorticity has
+            # no hourly stamps — skip its (time-exact) selection to avoid a KeyError/misalign.
+            if vorticity_file is not None and not MCS_ONLY:
                 vorticity_ds = xr.open_dataset(vorticity_file).squeeze('plev')
                 vorticity_ds = vorticity_ds.assign_coords(
                     longitude=(((vorticity_ds.longitude + 180) % 360) - 180)
@@ -1341,11 +1372,21 @@ def test_model_batch(data_dir, checkpoint_path=None, start_year=1980, end_year=2
             
             # Process wind speed data
             wind_speed_selected = None
-            if wind_speed_full is not None:
+            # MCS_ONLY (hourly): skip the time-exact wind_speed.sel — 6-hourly wind has no
+            # hourly stamps (would KeyError), and ch2-10 are zeroed at inference regardless.
+            if wind_speed_full is not None and not MCS_ONLY:
                 wind_speed_interp = wind_speed_full['wspd']
                 wind_speed_selected = wind_speed_interp.sel(time=era5_dates)
                 # wind_speed_selected = wind_speed_selected.where(wind_speed_selected >= 12, 12)
             
+            # MCS_ONLY: ch2-10 are zeroed at the forward pass; hand the channel builder
+            # zero-filled vorticity/wind_speed aligned to the (hourly) dara frames so
+            # self.vorticity[idx]/self.wind_speed[idx] index cleanly — they'd be None
+            # otherwise (no hourly 6-hourly-field match), and the dataset has no None guard.
+            if MCS_ONLY:
+                vorticity = xr.zeros_like(ivt)
+                wind_speed_selected = xr.zeros_like(ivt)
+
             # Interpolate percentile threshold to match dataset grid if needed
             interp_percentile = 400
             # if isinstance(percentile_threshold, (xr.DataArray, xr.Dataset)):

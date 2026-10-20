@@ -1,6 +1,12 @@
 import os
 import glob
 import numpy as np
+import os as _os_mod
+
+
+def _os_env(k, d):
+    """Env lookup for tracker thresholds; defaults reproduce original behaviour."""
+    return _os_mod.environ.get(k, d)
 import xarray as xr
 import pandas as pd
 from scipy import ndimage
@@ -70,6 +76,22 @@ class HurricaneTracker:
         # Meteorological parameters for hurricanes
         self.max_speed_kmh = 350  # 35 m/s converted to km per 6h (hurricanes can move faster than ETCs)
         self.min_speed_kmh = 40    # 2 m/s converted to km per 6h
+        # Linking speed window. The FLOOR is the dangerous one: a landfalling storm
+        # slows sharply, and centres are snapped to the 0.25 deg output grid, so two
+        # consecutive centres can land on the same cell -> displacement exactly 0 ->
+        # speed 0 -> the link is refused and the track breaks precisely where the
+        # storm stalls over land. Env-overridable so it can be measured; defaults
+        # reproduce the original 0.5-32 m/s window exactly.
+        self.min_speed_ms = float(_os_env("TC_MIN_SPEED_MS", "0.5"))
+        self.max_speed_ms = float(_os_env("TC_MAX_SPEED_MS", "32.0"))
+        # Land-aware gap bridging. Over ocean a long gap usually means two DIFFERENT
+        # storms, and widening the gap globally was measured to LOSE hits (318 ->
+        # 317 -> 315 for gap 4 -> 8 -> 12) by letting one track claim two storms.
+        # Over land the same gap means one storm weakening and possibly re-emerging
+        # (GULAB->SHAHEEN crossing India, FRED crossing Cuba), so the two cases want
+        # different limits. Default equals the ocean value, i.e. no behaviour change
+        # until asked for.
+        self.land_gap_steps = int(_os_env("TC_LAND_GAP_STEPS", "0"))
         
         self.min_path_km = 250.0        # Real hurricanes travel substantial distance
         self.min_hours = 48.0           # Minimum 48h duration (IBTrACS standard)
@@ -111,15 +133,25 @@ class HurricaneTracker:
         """
         Check if movement is meteorologically realistic (matching comparison code)
         """
-        distance = self.haversine_distance(lon1, lat1, lon2, lat2)
-        
+        # BUG FIX (2026-09-23): this call used to pass (lon1, lat1, lon2, lat2) into
+        # haversine_distance(lat1, lon1, lat2, lon2). The swap weights north-south
+        # motion by cos(lon1)*cos(lon2), which is ~0 near 90W and 90E, so a storm
+        # heading north at a US Gulf or Bay of Bengal landfall read as ~0 m/s, failed
+        # the speed floor, and its track was cut. TC_HAVERSINE_LEGACY=1 restores the
+        # old call so the pre-fix products can be reproduced byte-for-byte.
+        if _os_env("TC_HAVERSINE_LEGACY", "0") == "1":
+            distance = self.haversine_distance(lon1, lat1, lon2, lat2)
+        else:
+            distance = self.haversine_distance(lat1, lon1, lat2, lon2)
+
         if time_diff_hours <= 0:
             return False
         
         speed_ms = (distance * 1000.0) / (time_diff_hours * 3600.0)
         
-        # Moderate speed constraints: 0.5-32 m/s (allow stalling hurricanes like Harvey)
-        if speed_ms < 0.5 or speed_ms > 32.0:
+        # Moderate speed constraints (allow stalling hurricanes like Harvey).
+        # See self.min_speed_ms in __init__ for why the floor is the risky one.
+        if speed_ms < self.min_speed_ms or speed_ms > self.max_speed_ms:
             return False
         
         # Latitude change constraint
@@ -144,6 +176,7 @@ class HurricaneTracker:
             return False
         
         return True
+    
     def is_over_ocean(self, lat, lon, threshold=0.5):
         """
         Check if a location is over ocean using land-sea mask
@@ -236,7 +269,7 @@ class HurricaneTracker:
         dlon = lon2 - lon1
         a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
         return self.earth_radius_km * 2 * np.arcsin(np.sqrt(a))
-    def extract_hurricane_centers(self, hurricane_mask, lats, lons, threshold=0.5):
+    def extract_hurricane_centers(self, hurricane_mask, lats, lons, threshold=0.5, mslp_field=None):
         """
         Extract hurricane centers from detection mask (CONUS region only)
         
@@ -275,8 +308,19 @@ class HurricaneTracker:
             if np.sum(single_hurricane) < self.min_hurricane_area:
                 continue
             
-            # Calculate center of mass
-            center_y, center_x = center_of_mass(single_hurricane)
+            # Centre. Default: mask centroid (original behaviour). TC_CENTER=mslp puts the
+            # centre on the MSLP minimum INSIDE the blob: the full-lifecycle masks are
+            # 200-500 km discs clipped by coastlines, so the centroid can sit well off
+            # the low, which jitters speeds, breaks links and flips ocean/land tests.
+            if _os_env("TC_CENTER", "mass") == "mslp" and mslp_field is not None:
+                _reg = mslp_field[np.ix_(lat_indices, lon_indices)]
+                _v = np.where(single_hurricane, _reg, np.inf)
+                if np.isfinite(_v).any():
+                    center_y, center_x = np.unravel_index(int(np.argmin(_v)), _v.shape)
+                else:
+                    center_y, center_x = center_of_mass(single_hurricane)
+            else:
+                center_y, center_x = center_of_mass(single_hurricane)
             
             # Convert pixel coordinates to lat/lon using regional coordinates
             if center_y < len(regional_lats) and center_x < len(regional_lons):
@@ -295,11 +339,20 @@ class HurricaneTracker:
                         continue
                     
                     # Check 2: Minimum intensity threshold
-                    if max_intensity < 0.40:  # Low to capture weak/forming phases
+                    if max_intensity < float(_os_env("TC_FRAME_INTENSITY", "0.40")):
                         continue
-                    
-                    # Check 3: Reasonable area (not too small, not suspiciously large)
-                    if area_pixels < 3 or area_pixels > 500:  # Keep low for detection continuity
+
+                    # Check 3: Reasonable area.
+                    # The 500 px ceiling was calibrated for the old heuristic, whose
+                    # detections were 200 km dilated centres (~163 px at 0.25 deg).
+                    # The IBTrACS target uses ROCI-sized discs — median 324 km
+                    # (~429 px), clamped to 500 km (~1018 px) — so measured on the
+                    # exported detections the old cap discards 34.1% of blobs, and
+                    # preferentially the LARGEST storms, breaking track continuity
+                    # for exactly the major hurricanes that matter most. A cap of
+                    # 2000 px rejects 0% while still excluding anything absurd.
+                    if area_pixels < int(_os_env("TC_MIN_AREA_PX", "3")) or \
+                            area_pixels > int(_os_env("TC_MAX_AREA_PX", "500")):
                         continue
                     
                     hurricane_centers.append({
@@ -488,7 +541,14 @@ class HurricaneTracker:
                 lons = hurricane_ds.longitude.values
                 
                 # Extract hurricane centers (CONUS region only)
-                hurricanes = self.extract_hurricane_centers(hurricane_mask, lats, lons)
+                _mslp_c = None
+                if mslp_data is not None and _os_env("TC_CENTER", "mass") == "mslp":
+                    try:
+                        _mslp_c = mslp_data.sel(time=timestamp, method='nearest').values
+                    except Exception:
+                        _mslp_c = None
+                hurricanes = self.extract_hurricane_centers(hurricane_mask, lats, lons,
+                                                            mslp_field=_mslp_c)
                 conus_detections_count += len(hurricanes)
                 
                 # Count total detections for comparison (optional)
@@ -575,18 +635,68 @@ class HurricaneTracker:
             print(f"Found {len(all_detections)} CONUS hurricane detections and {len(tracks)} tracks for year {year}")
         else:
             print(f"No CONUS hurricane detections found for year {year}")
+    # Rejection tally, so a run reports WHICH criterion discards tracks rather than
+    # leaving it to be guessed. These filters were tuned when the model emitted
+    # ~45,000 detections and aggressive filtering was essential; the IBTrACS-target
+    # model emits ~1,900, so several are now expected to cost real storms.
+    REJECT = {}
+
+    # The REJECT tally only sees tracks that already cleared close_track's own
+    # >=5 points AND >=48 h gates, so it under-reports: a candidate killed by
+    # those two never reaches validate_hurricane_track and is invisible here.
+    # With TC_CAPTURE_CANDIDATES=1 every closed candidate is recorded together
+    # with the criterion that ended it, which is what lets a miss be attributed
+    # to segmentation / linking / validation rather than guessed at. Off by
+    # default, so a production run behaves exactly as before.
+    # Did the land-aware bridge actually engage? A null result from a lever that
+    # never fired is not a null result, so this is counted rather than assumed.
+    LAND_BRIDGE = {"checked": 0, "over_land": 0, "extended": 0}
+    CANDIDATES = []
+    CAPTURE = bool(int(_os_env("TC_CAPTURE_CANDIDATES", "0")))
+    LAST_REJECT = None
+
+    @classmethod
+    def _capture(cls, dets, reason):
+        if not cls.CAPTURE:
+            return
+        cls.CANDIDATES.append({
+            "reason": reason,
+            "points": [(d['timestamp'], float(d['center_lat']),
+                        float(d['center_lon']), int(d.get('area_pixels', 0)))
+                       for d in dets],
+        })
+
+    def _rej(self, why):
+        HurricaneTracker.REJECT[why] = HurricaneTracker.REJECT.get(why, 0) + 1
+        HurricaneTracker.LAST_REJECT = why
+        return False
+
     def validate_hurricane_track(self, track_detections):
         """
-        STRICT validation matching IBTrACS comparison criteria
+        STRICT validation matching IBTrACS comparison criteria.
+
+        Thresholds are env-overridable so they can be re-tuned for a cleaner
+        detection field without editing this file. Defaults reproduce the original
+        behaviour exactly.
+          TC_MIN_POINTS TC_MIN_DURATION_H TC_MIN_PATH_KM TC_MIN_INTENSITY
+          TC_GENESIS_LAT TC_MIN_OCEAN_FRAC TC_MIN_STRAIGHTNESS
         """
-        if len(track_detections) < 5:
-            return False
+        import os as _os
+        _minpts = int(_os.environ.get("TC_MIN_POINTS", "5"))
+        if len(track_detections) < _minpts:
+            return self._rej("n_points")
         
         # ============================
         # 1. OCEAN GENESIS REQUIREMENT
         # ============================
-        if not self.requires_ocean_genesis(track_detections, min_ocean_points=1):
-            return False
+        # TC_OCEAN_GENESIS=0 disables this gate (default 1 = original behaviour). With the
+        # full-lifecycle TC model a storm stays detected over land, so a track can begin
+        # over land after a linking gap, or on a coastal/island centroid: Wilma 2005
+        # (160 kt) and Elena 1985 (110 kt) were detected at 92-100% of positions and
+        # rejected here.
+        if _os.environ.get("TC_OCEAN_GENESIS", "1") == "1" and \
+                not self.requires_ocean_genesis(track_detections, min_ocean_points=1):
+            return self._rej("ocean_genesis")
         
         # ============================
         # 2. FORMATION ZONE - Must start in tropics/subtropics
@@ -595,12 +705,13 @@ class HurricaneTracker:
         first_lon = track_detections[0]['center_lon']
         
         # Moderate: allow subtropical formation up to 38 degrees
-        if not (-38.0 <= first_lat <= 38.0):
-            return False
+        _glat = float(_os.environ.get("TC_GENESIS_LAT", "38.0"))
+        if not (-_glat <= first_lat <= _glat):
+            return self._rej("genesis_lat")
         
         # NEW: Exclude tracks starting north of 36N AND west of 80W (land-based systems)
         if first_lat >= 36.0 and first_lon <= -85.0:
-            return False
+            return self._rej("nw_landstart")
         
         # ============================
         # 3. LATITUDE CONSTRAINTS
@@ -608,12 +719,12 @@ class HurricaneTracker:
         # Allow more time at higher latitudes for recurving storms
         high_lat_count = sum(1 for d in track_detections if abs(d['center_lat']) > 45.0)
         if high_lat_count / len(track_detections) > 0.50:
-            return False
+            return self._rej("high_lat_frac")
         
         # NEW: Reject tracks north of 40N AND west of 110W (continental systems)
         for detection in track_detections:
             if detection['center_lat'] >= 40.0 and detection['center_lon'] <= -110.0:
-                return False
+                return self._rej("continental")
         
         # ============================
         # 4. OCEAN PERCENTAGE - Match comparison code
@@ -623,8 +734,8 @@ class HurricaneTracker:
         ocean_percentage = ocean_count / len(track_detections)
         
         # Allow hurricanes that persist over land after landfall
-        if ocean_percentage < 0.35:
-            return False
+        if ocean_percentage < float(_os.environ.get("TC_MIN_OCEAN_FRAC", "0.35")):
+            return self._rej("ocean_frac")
         
         # ============================
         # 5. DURATION CHECK - Match IBTrACS minimum
@@ -634,8 +745,8 @@ class HurricaneTracker:
         duration_hours = (end_time - start_time).total_seconds() / 3600.0
         
         # IBTrACS standard minimum
-        if duration_hours < 48.0:
-            return False
+        if duration_hours < float(_os.environ.get("TC_MIN_DURATION_H", "48.0")):
+            return self._rej("duration")
         
         # ============================
         # 6. PATH LENGTH
@@ -648,8 +759,8 @@ class HurricaneTracker:
             )
             total_distance += dist
         
-        if total_distance < 250.0:  # Slightly lower for short-lived but real TCs
-            return False
+        if total_distance < float(_os.environ.get("TC_MIN_PATH_KM", "250.0")):
+            return self._rej("path_km")
         
         # ============================
         # 7. MOVEMENT VALIDATION
@@ -677,7 +788,7 @@ class HurricaneTracker:
                 seen_west105 = True
             
             if seen_west105 and lat >= 35.0 and lon >= -100.0:
-                return False
+                return self._rej("west_recurve")
             
         # ============================
         # 8. SPEED VALIDATION
@@ -698,11 +809,11 @@ class HurricaneTracker:
                 speeds.append(speed_ms)
                 
                 # Moderate hurricane speed bounds: 0.5-32 m/s
-                if speed_ms < 0.5 or speed_ms > 32.0:
+                if speed_ms < self.min_speed_ms or speed_ms > self.max_speed_ms:
                     unrealistic_movements += 1
         
         if speeds and unrealistic_movements / len(speeds) > 0.3:
-            return False
+            return self._rej("speed")
         
         # ============================
         # 9. BAND LOGIC - Match comparison code
@@ -733,7 +844,7 @@ class HurricaneTracker:
         start_in_gulf = (first_lon <= -82.0 and self.is_over_ocean(first_lat, first_lon))
         if (east_fraction > 0.5 and entered_band and 
             not touched_ocean_in_band and not start_ocean_east82 and not start_in_gulf):
-            return False
+            return self._rej("band_ocean")
         
         # ============================
         # 10. INTENSITY CHECK
@@ -741,8 +852,8 @@ class HurricaneTracker:
         intensities = [d.get('max_intensity', 0) for d in track_detections]
         max_intensity = max(intensities) if intensities else 0
         
-        if max_intensity < 0.50:
-            return False
+        if max_intensity < float(_os.environ.get("TC_MIN_INTENSITY", "0.50")):
+            return self._rej("intensity")
         
         # ============================
         # 11. NET DISPLACEMENT - Progressive movement
@@ -755,8 +866,8 @@ class HurricaneTracker:
         # Net displacement should be at least 20% of total path
         if total_distance > 0:
             displacement_ratio = net_displacement / total_distance
-            if displacement_ratio < 0.12:
-                return False
+            if displacement_ratio < float(_os.environ.get("TC_MIN_STRAIGHTNESS", "0.12")):
+                return self._rej("straightness")
         
         # ============================
         # 12. BEARING CONSISTENCY - Reject zigzag/noise tracks
@@ -786,7 +897,7 @@ class HurricaneTracker:
                 return False
         
         return True
-    def create_hurricane_tracks(self, df, max_gap_steps=4):
+    def create_hurricane_tracks(self, df, max_gap_steps=None):
         """
         Create hurricane tracks from individual detections.
         Tracks persist across gaps of up to max_gap_steps consecutive missing
@@ -801,6 +912,8 @@ class HurricaneTracker:
             Maximum number of consecutive 6-h timesteps a track may survive
             without a matched detection before it is closed. Default 4 (= 24 h).
         """
+        if max_gap_steps is None:
+            max_gap_steps = int(_os_env("TC_MAX_GAP_STEPS", "4"))
         if df.empty:
             return []
         df = df.sort_values('timestamp').reset_index(drop=True)
@@ -828,15 +941,27 @@ class HurricaneTracker:
         active_tracks = []
         finished_tracks = []
         track_id_counter = [0]   # list so inner helpers can mutate it
+        # These two gates were hardcoded, which silently disabled the
+        # TC_MIN_POINTS / TC_MIN_DURATION_H knobs in validate_hurricane_track:
+        # a candidate under 5 points or 48 h died here and never reached the
+        # function those variables configure. They now read the SAME variables,
+        # with the same defaults, so the knobs actually do something.
+        _minpts_ct = int(_os_env("TC_MIN_POINTS", "5"))
+        _mindur_ct = float(_os_env("TC_MIN_DURATION_H", "48.0"))
+
         def close_track(tr):
             """Move a track from active → finished after validation."""
             dets = tr['detections']
-            if len(dets) < 5:
+            if len(dets) < _minpts_ct:
+                HurricaneTracker._capture(dets, "n_points_lt5")
                 return
             duration = (dets[-1]['timestamp'] - dets[0]['timestamp']).total_seconds() / 3600.0
-            if duration < 48.0:
+            if duration < _mindur_ct:
+                HurricaneTracker._capture(dets, "duration_lt48")
                 return
+            HurricaneTracker.LAST_REJECT = None
             if self.validate_hurricane_track(dets):
+                HurricaneTracker._capture(dets, "accepted")
                 finished_tracks.append({
                     'track_id'      : track_id_counter[0],
                     'detections'    : dets,
@@ -845,6 +970,9 @@ class HurricaneTracker:
                     'end_time'      : dets[-1]['timestamp'],
                 })
                 track_id_counter[0] += 1
+            else:
+                HurricaneTracker._capture(
+                    dets, f"rej:{HurricaneTracker.LAST_REJECT}")
         # ------------------------------------------------------------------ #
         # Main loop — one iteration per timestep                              #
         # ------------------------------------------------------------------ #
@@ -913,7 +1041,20 @@ class HurricaneTracker:
                 else:
                     # ---- Miss: increment gap counter ---------------------
                     new_gap = tr['gap_count'] + 1
-                    if new_gap > max_gap_steps:
+                    # Over land, allow a longer bridge: the storm is weakening and
+                    # may re-emerge, whereas the same gap over ocean usually means
+                    # two different storms.
+                    _limit = max_gap_steps
+                    if self.land_gap_steps > max_gap_steps:
+                        HurricaneTracker.LAND_BRIDGE["checked"] += 1
+                        if not self.is_over_ocean(tr['ghost_lat'],
+                                                  tr['ghost_lon']):
+                            _limit = self.land_gap_steps
+                            HurricaneTracker.LAND_BRIDGE["over_land"] += 1
+                            if new_gap > max_gap_steps:
+                                # would have died at the ocean limit
+                                HurricaneTracker.LAND_BRIDGE["extended"] += 1
+                    if new_gap > _limit:
                         # Too many consecutive misses → close track
                         close_track(tr)
                     else:

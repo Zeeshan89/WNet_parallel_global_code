@@ -23,7 +23,7 @@
 #SBATCH --ntasks-per-node=8
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=7
-#SBATCH --time=00:30:00
+#SBATCH --time=01:15:00
 #SBATCH -o logs/test_dist-%j.txt
 #SBATCH -e logs/test_dist-err-%j.txt
 #SBATCH --export=NONE

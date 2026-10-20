@@ -47,6 +47,7 @@ import xarray as xr
 import matplotlib.pyplot as plt
 import os
 import sys
+import json
 import warnings
 from warnings import filterwarnings
 filterwarnings("ignore", category=DeprecationWarning)
@@ -245,7 +246,27 @@ chunk_size                  = 12
 target_size                 = (192, 384)
 epochs_per_file             = 3
 num_passes                  = 20
-in_channels                 = 14
+
+# ── Phase 1: predictor / label split ─────────────────────────────────────────
+# SPLIT_MODE=1 (or --split) feeds the model ONLY the 6 continuous physical
+# fields and hands the heuristic masks to the loss separately, so the copy
+# shortcut Phase 0 measured cannot be expressed. SPLIT_MODE=0 keeps the legacy
+# 14-channel contract for reproducing existing runs.
+SPLIT_MODE = os.environ.get("SPLIT_MODE", "0") == "1"
+in_channels = ARDatasetImproved.N_PREDICTORS if SPLIT_MODE else 14
+
+# Standardisation for the split predictors — built by compute_predictor_stats.py.
+# The split cache holds RAW physical values, so this file is what makes them
+# trainable; without it the dataset warns loudly and passes raw fields through.
+PREDICTOR_STATS_PATH = os.environ.get("PREDICTOR_STATS", "predictor_stats.json")
+predictor_stats = None
+if SPLIT_MODE:
+    try:
+        with open(PREDICTOR_STATS_PATH) as _f:
+            predictor_stats = json.load(_f)["stats"]
+    except Exception as _e:
+        print(f"⚠ SPLIT_MODE on but could not read {PREDICTOR_STATS_PATH} ({_e}). "
+              f"Run compute_predictor_stats.py first.")
 
 model        = None
 dataset      = None
@@ -571,7 +592,9 @@ def _process_one_file(
             mcs_moisture_mode="anomaly",              # "anomaly" | "anomaly_soft" | "absolute"
             ibtracs_lookup=ibtracs_this_month,
             year=year,
-            month=month
+            month=month,
+            output_mode=("split" if SPLIT_MODE else "legacy"),
+            predictor_stats=predictor_stats,
         )
 
         timing["dataset_init"] = time.time() - _t; _t = time.time()
@@ -611,6 +634,7 @@ def _process_one_file(
                 accumulator=val_accumulator,
                 use_amp=(scaler is not None),
                 rank=rank,
+                split=SPLIT_MODE,
             )
             timing["val"] = time.time() - _t
             if rank == 0:
@@ -643,6 +667,7 @@ def _process_one_file(
             ema=ema,
             file_idx=file_idx,
             global_epoch_offset=global_epoch_offset,
+            split=SPLIT_MODE,
         )
 
         timing["train"] = time.time() - _t

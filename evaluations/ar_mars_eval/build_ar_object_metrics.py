@@ -29,7 +29,10 @@ PERIODS = {"oop": (1980, 2005), "primary": (2006, 2024)}
 FRACS = [0.10, 0.25, 0.50]      # overlap fractions to report
 MINPX = 10                      # drop objects smaller than this (noise specks)
 HERE = os.path.dirname(os.path.abspath(__file__))
-MONTH_STRIDE = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+# Read only when run as a script. Leaving this at module scope made the file
+# unimportable, because any other CLI's argv[1] would hit the int() call; the
+# v2 object pass reuses label_wrap/object_coverage from here.
+MONTH_STRIDE = 1
 
 
 def period_of(year):
@@ -169,4 +172,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        MONTH_STRIDE = int(sys.argv[1])
     main()

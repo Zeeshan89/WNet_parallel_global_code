@@ -52,25 +52,78 @@ class SegmentationMetricAccumulator:
 
     def __init__(self, device,
                  target_threshold: float = 0.5,
-                 prob_threshold: float   = 0.5):
+                 prob_threshold: float   = 0.5,
+                 valid_mask=None):
         self.device           = device
         self.target_threshold = target_threshold
         self.prob_threshold   = prob_threshold
+        # valid_mask: None (default, ERA5 behaviour unchanged) or (H,W)/(C,H,W).
+        # Only masked-in pixels contribute to tp/fp/fn, so a regional model is not
+        # scored on the ~29% of its frame outside the model domain, nor the
+        # Hurricane head on the region where its label is undefined.
+        self.valid_mask = None
+        if valid_mask is not None:
+            vm = torch.as_tensor(valid_mask)
+            if vm.dim() == 2:
+                vm = vm.unsqueeze(0)
+            self.valid_mask = vm.to(device).bool()
         # tp/fp/fn shape: (NUM_CLASSES, 2) — last dim: 0=argmax, 1=thresh
         self.tp = torch.zeros(NUM_FG_CLASSES, 2, dtype=torch.float64, device=device)
         self.fp = torch.zeros(NUM_FG_CLASSES, 2, dtype=torch.float64, device=device)
         self.fn = torch.zeros(NUM_FG_CLASSES, 2, dtype=torch.float64, device=device)
 
     @torch.no_grad()
-    def update(self, seg_probs: torch.Tensor, batch: torch.Tensor) -> None:
+    def update(self, seg_probs: torch.Tensor, batch: torch.Tensor,
+               split: bool = False, multilabel: bool = False) -> None:
         """
-        seg_probs : (B, 5, H, W) softmax over {bg, AR, Hurr, ETC, MCS}
-        batch     : (B, 14, H, W) input; targets at channels [1, 5, 10, 13]
+        seg_probs : multilabel=False -> (B, 5, H, W) softmax over
+                                        {bg, AR, Hurr, ETC, MCS}
+                    multilabel=True  -> (B, 4, H, W) INDEPENDENT per-class
+                                        sigmoids, no background channel
+        batch     : split=False -> (B, 14, H, W) input, targets read from
+                                   channels [1, 5, 10, 13] (legacy contract,
+                                   where the targets were also model inputs)
+                    split=True  -> (B, 4, H, W) label tensor, one channel per
+                                   class in order (AR, Hurricane, ETC, MCS)
+
+        multilabel note: with independent heads there is no argmax — a pixel may
+        belong to several classes and "highest scoring class" is not a decision
+        the model makes. The argmax variant is therefore meaningless, so BOTH
+        variants are filled with the per-class threshold counts. The plain keys
+        ("ar_iou", ...) that plot_losses.py reads stay populated and correct;
+        "*_thresh" is identical rather than a second opinion.
         """
+        if multilabel:
+            n_cls = seg_probs.shape[1]
+            if n_cls != NUM_FG_CLASSES:
+                raise ValueError(f"multilabel expects {NUM_FG_CLASSES} channels, "
+                                 f"got {n_cls}")
+            vm = getattr(self, "valid_mask", None)
+            for i, _ in enumerate(CLASS_INFO):
+                target_pos = (batch[:, i] > self.target_threshold)
+                pred_pos = (seg_probs[:, i] > self.prob_threshold)
+                if vm is not None:
+                    # Exclude out-of-domain / label-undefined pixels from the counts.
+                    # Without this a RegCM IoU is diluted by ~29% of the frame that
+                    # the model was never asked to predict.
+                    m = (vm[i] if vm.shape[0] > 1 else vm[0]).to(pred_pos.device).bool()
+                    target_pos = target_pos & m
+                    pred_pos = pred_pos & m
+                tp = (pred_pos & target_pos).sum().to(torch.float64)
+                fp = (pred_pos & ~target_pos).sum().to(torch.float64)
+                fn = (~pred_pos & target_pos).sum().to(torch.float64)
+                for variant in (0, 1):
+                    self.tp[i, variant] += tp
+                    self.fp[i, variant] += fp
+                    self.fn[i, variant] += fn
+            return
+
         pred_classes = seg_probs.argmax(dim=1)  # (B, H, W) ∈ {0..4} — argmax variant
 
         for i, (_, cls_idx, ch_idx) in enumerate(CLASS_INFO):
-            target_pos = (batch[:, ch_idx] > self.target_threshold)
+            # In split mode the labels arrive already separated, so the class
+            # position selects them directly rather than indexing the input.
+            target_pos = (batch[:, i if split else ch_idx] > self.target_threshold)
 
             # ── Variant 0: argmax (mutually exclusive) ─────────────────────────
             pred_argmax = (pred_classes == cls_idx)

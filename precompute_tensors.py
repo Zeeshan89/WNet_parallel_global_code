@@ -89,14 +89,15 @@ def _parse_date_str(nc_file):
     return date_str, int(date_str[:4]), int(date_str[4:6])
 
 
-def file_already_cached(nc_file, tensor_dir):
-    """Check if .npy tensor cache already exists for this file."""
+def file_already_cached(nc_file, tensor_dir, split=False):
+    """Check if the .npy tensor cache already exists for this file."""
     try:
         date_str, _, _ = _parse_date_str(nc_file)
     except ValueError:
         return False
-    npy_path  = os.path.join(tensor_dir, f"tensors_{date_str}.npy")
-    meta_path = os.path.join(tensor_dir, f"tensors_{date_str}.meta.npy")
+    prefix = "split" if split else "tensors"
+    npy_path  = os.path.join(tensor_dir, f"{prefix}_{date_str}.npy")
+    meta_path = os.path.join(tensor_dir, f"{prefix}_{date_str}.meta.npy")
     return os.path.exists(npy_path) and os.path.exists(meta_path)
 
 
@@ -235,11 +236,17 @@ def precompute_one_file(
     nc_file, tensor_dir,
     vor850_per, windspeed_per, mslp_clim, ibtracs_lookup,
     vorticity_files, wind_speed_full,
-    rank,
+    rank, split=False,
 ):
     """
     Load one monthly file, run ARDatasetImproved precompute,
     save tensors to disk.
+
+    split=False : legacy (N, 14, H, W) tensors — input and target entangled.
+    split=True  : Phase 1 (N, 10, H, W) tensors — 6 RAW physical predictors
+                  followed by the 4 heuristic label masks. Reuses an existing
+                  legacy month for the masks when one is present, which makes
+                  this seconds per month instead of ~23 minutes.
 
     Returns (date_str, n_samples, elapsed_seconds) or None on error.
     """
@@ -254,8 +261,9 @@ def precompute_one_file(
         print(f"  [ERROR] Rank {rank}: {e}")
         return None
 
-    npy_path  = os.path.join(tensor_dir, f"tensors_{date_str}.npy")
-    meta_path = os.path.join(tensor_dir, f"tensors_{date_str}.meta.npy")
+    prefix = "split" if split else "tensors"
+    npy_path  = os.path.join(tensor_dir, f"{prefix}_{date_str}.npy")
+    meta_path = os.path.join(tensor_dir, f"{prefix}_{date_str}.meta.npy")
 
     # ── Skip if already cached ────────────────────────────────────────────────
     if os.path.exists(npy_path) and os.path.exists(meta_path):
@@ -346,6 +354,30 @@ def precompute_one_file(
                     coords=coords_dict,
                 )
 
+        # ── Raw IVT for the split predictor stack ─────────────────────────────
+        # The preprocessed cache's `ivt` was built with ivt_percentile=400, so
+        # it is zeroed below that and has IoU 0.917 with the AR label — using it
+        # as a model input would re-create the Phase 0 copy shortcut. Recompute
+        # the true field from the source Qu/Qv, matching the cache's longitude
+        # roll (-180..180, sorted) so it lands on the same grid.
+        if split:
+            src = xr.open_dataset(os.path.join(DATA_DIR, nc_file))
+            src = src.assign_coords(
+                longitude=(((src.longitude + 180) % 360) - 180)).sortby('longitude')
+            ivt_raw = np.sqrt(src['Qu'].values ** 2 + src['Qv'].values ** 2
+                              ).astype(np.float32)
+            src.close()
+            if ivt_raw.shape != ERA5_6hrly_ARs['ivt'].shape:
+                raise ValueError(
+                    f"raw IVT shape {ivt_raw.shape} != cached ivt shape "
+                    f"{ERA5_6hrly_ARs['ivt'].shape} for {nc_file}")
+            ERA5_6hrly_ARs['ivt_raw'] = xr.DataArray(
+                ivt_raw, dims=["time", "latitude", "longitude"],
+                coords=ERA5_6hrly_ARs['ivt'].coords)
+            print(f"  [split] raw IVT from Qu/Qv: "
+                  f"{100*(ivt_raw == 0).mean():.2f}% zeros "
+                  f"(cached ivt is {100*(ERA5_6hrly_ARs['ivt'].values == 0).mean():.2f}%)")
+
         # ── IBTrACS slice for this month ──────────────────────────────────────
         era5_6h_keys = [
             pd.Timestamp(t).to_pydatetime().replace(
@@ -396,12 +428,19 @@ def precompute_one_file(
             ibtracs_lookup=ibtracs_this_month,
             year=year,
             month=month,
+            output_mode=("split" if split else "legacy"),
         )
 
         # ── Save tensors to the requested tensor_dir ──────────────────────────
+        # legacy: (N, 14, H, W)   split: (N, 10, H, W) = 6 raw predictors + 4 labels
+        # In split mode the dataset already saved to its own SPLIT_CACHE_DIR, so
+        # only write again when tensor_dir points somewhere else — a redundant
+        # 366 MB rewrite per month is real I/O on Lustre.
         os.makedirs(tensor_dir, exist_ok=True)
-        np.save(npy_path,  dataset.precomputed_data)   # (N, 14, H, W) float32
-        np.save(meta_path, time_values)                # time axis metadata
+        already_saved = split and os.path.exists(npy_path)
+        if not already_saved:
+            np.save(npy_path,  dataset.precomputed_data)
+            np.save(meta_path, time_values)            # time axis metadata
 
         elapsed  = time.time() - t0
         n_samples = len(dataset)
@@ -439,14 +478,25 @@ def main():
     )
     parser.add_argument("--start_year", type=int, default=START_YEAR)
     parser.add_argument("--end_year",   type=int, default=END_YEAR)
-    parser.add_argument("--tensor_dir", type=str, default=TENSOR_DIR)
+    parser.add_argument("--tensor_dir", type=str, default=None,
+                        help="Output dir (defaults to the legacy or split cache "
+                             "depending on --split)")
     parser.add_argument(
         "--overwrite", action="store_true",
         help="Re-compute even if .npy cache already exists",
     )
+    parser.add_argument(
+        "--split", action="store_true",
+        help="Build the Phase 1 split cache: (N, 10, H, W) = 6 RAW physical "
+             "predictors + 4 label masks, instead of the legacy 14-channel "
+             "tensors where inputs and targets were entangled. Reuses existing "
+             "legacy months for the masks, so it runs in seconds per month.",
+    )
     args = parser.parse_args()
 
-    tensor_dir = args.tensor_dir
+    from dataset import ARDatasetImproved
+    tensor_dir = args.tensor_dir or (
+        ARDatasetImproved.SPLIT_CACHE_DIR if args.split else TENSOR_DIR)
 
     if rank == 0:
         print(f"\n{'='*60}")
@@ -454,6 +504,7 @@ def main():
         print(f"{'='*60}")
         print(f"  World size : {world_size} ranks")
         print(f"  Year range : {args.start_year}–{args.end_year}")
+        print(f"  Mode       : {'SPLIT (6 predictors + 4 labels)' if args.split else 'legacy (14 ch)'}")
         print(f"  Output dir : {tensor_dir}")
         print(f"  Overwrite  : {args.overwrite}")
         print(f"{'='*60}\n")
@@ -523,7 +574,7 @@ def main():
     # Optionally filter out already-cached files
     if not args.overwrite:
         pending = [f for f in my_files
-                   if not file_already_cached(f, tensor_dir)]
+                   if not file_already_cached(f, tensor_dir, split=args.split)]
         skipped_upfront = len(my_files) - len(pending)
         if skipped_upfront > 0:
             print(f"[Rank {rank}] Skipping {skipped_upfront} already-cached "
@@ -554,6 +605,7 @@ def main():
             vorticity_files=vorticity_files,
             wind_speed_full=wind_speed_full,
             rank=rank,
+            split=args.split,
         )
 
         if result is not None:

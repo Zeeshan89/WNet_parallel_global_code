@@ -37,8 +37,48 @@ class ARDatasetImproved(Dataset):
     """
     TENSOR_CACHE_DIR = "/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/tensor_cache_v2"
 
-    def __init__(self, 
-                data: xr.Dataset, 
+    # ── Phase 1: predictor / label split ─────────────────────────────────────
+    # In the legacy 14-channel contract each class's training target was ALSO an
+    # input channel (AR<-ch1, Hurricane<-ch5, ETC<-ch10, MCS<-ch13), so a single
+    # conv weight could satisfy the loss by copying it through. Phase 0 measured
+    # exactly that (see phase0_diagnostics/): zeroing a class's target channel
+    # drove its prediction to 0 pixels. In "split" mode the model sees ONLY
+    # continuous physical fields; the heuristic masks are returned separately and
+    # are visible solely to the loss and the metrics, which makes copying
+    # structurally impossible rather than merely discouraged.
+    SPLIT_CACHE_DIR = ("/lustre/orion/proj-shared/cli138/z7a/Storms_data/"
+                       "Storms_precipitation_notebooks/tensor_cache_v3_split")
+
+    # (name, attribute on self) — the 6 fields the science criteria actually use.
+    # Wind shear, 500 mb temperature, SST and precipitation are deliberately
+    # excluded: no active detector reads them.
+    # NOTE on IVT: `self.ivt` is NOT usable as a predictor. The preprocessed
+    # HDF5 cache was built with ivt_percentile=400, which zeroed every pixel
+    # below 400 kg/m/s — it is 93% zeros and has IoU 0.917 with the AR label.
+    # Feeding it would hand the model the AR answer and re-create exactly the
+    # shortcut Phase 1 exists to remove. `self.ivt_raw` is the true field,
+    # recomputed as sqrt(Qu^2 + Qv^2) from the source ERA5 file.
+    PREDICTOR_SPECS = [
+        ("IVT",        "ivt_raw"),      # ARs   (raw, NOT the 400-thresholded ivt)
+        ("MSLP",       "mslp"),         # ETCs, TCs
+        ("vorticity",  "vorticity"),    # ETCs, TCs (850 mb)
+        ("wind_speed", "wind_speed"),   # ETCs, TCs (850 mb)
+        ("BT",         "bt_ds"),        # MCS (cloud-top brightness temperature)
+        ("IWV",        "iwv"),          # MCS, ARs (moisture)
+    ]
+    PREDICTOR_NAMES = [n for n, _ in PREDICTOR_SPECS]
+    N_PREDICTORS = len(PREDICTOR_SPECS)
+
+    # Label order matches the segmentation class order (class index = i + 1).
+    LABEL_NAMES = ["AR", "Hurricane", "ETC", "MCS"]
+    # Where each label lives in the legacy 14-channel tensor. Lets the split
+    # cache reuse an existing v2 month instead of re-running ~23 min of scipy
+    # mask work per month.
+    LEGACY_LABEL_CHANNELS = [1, 5, 10, 13]
+    N_LABELS = len(LABEL_NAMES)
+
+    def __init__(self,
+                data: xr.Dataset,
                 ivt_percentile: Optional[xr.DataArray] = None, 
                 vorticity_threshold: Optional[float] = None, 
                 ars: Optional[xr.DataArray] = None, 
@@ -58,7 +98,9 @@ class ARDatasetImproved(Dataset):
                 iwv_anom_soft_band: float = 5.0,
                 ibtracs_lookup: Optional[dict] = None,
                 year=None,
-                month=None
+                month=None,
+                output_mode: str = "legacy",
+                predictor_stats: Optional[Dict[str, Dict[str, float]]] = None,
                 ):
         """
         Initialize the enhanced AR dataset with improved ETC detection using multi-level vorticity
@@ -78,6 +120,16 @@ class ARDatasetImproved(Dataset):
         self.preload_data = preload_data
         self.year  = year
         self.month = month
+
+        # Phase 1 contract. "legacy" -> one (14, H, W) tensor, input and target
+        # entangled. "split" -> (predictors (6, H, W), labels (4, H, W)).
+        if output_mode not in ("legacy", "split"):
+            raise ValueError(f"output_mode must be 'legacy' or 'split', got {output_mode!r}")
+        self.output_mode = output_mode
+        # Per-predictor {mean, std} used to standardise at __getitem__ time. The
+        # split cache stores RAW physical values on purpose, so the normalisation
+        # can be corrected without rebuilding ~200 GB of tensors.
+        self.predictor_stats = predictor_stats
 
         # Store global percentiles for threshold calculation
         self.global_percentiles = global_percentiles or {}
@@ -114,6 +166,11 @@ class ARDatasetImproved(Dataset):
         
         # Core data arrays - only what's needed
         self.ivt = self._convert_to_numpy(extract_var(data, 'ivt'), dtype=np.float32)
+        # Raw, unthresholded IVT for the Phase 1 predictor stack. `ivt` above is
+        # zeroed below 400 kg/m/s by the preprocessed cache and must never be
+        # used as a model input — see PREDICTOR_SPECS.
+        self.ivt_raw = self._convert_to_numpy(
+            extract_var(data, ['ivt_raw', 'IVT_raw']), dtype=np.float32)
         self.mslp = self._convert_to_numpy(extract_var(data, 'mslp'), dtype=np.float32)
         self.ivt_grad = self._convert_to_numpy(extract_var(data, 'ivt_grad'), dtype=np.float32)
         self.vorticity_grad = self._convert_to_numpy(extract_var(data, 'vorticity_grad'), dtype=np.float32)
@@ -242,8 +299,11 @@ class ARDatasetImproved(Dataset):
         # PRE-COMPUTE all 14-channel tensors for every sample so __getitem__
         # becomes a cheap array lookup instead of expensive scipy operations.
         if precompute:
-            # self._precompute_all_channels()
-            self._precompute_all_channels_cached(year=year, month=month)
+            if self.output_mode == "split":
+                self._precompute_split_cached(year=year, month=month)
+            else:
+                # self._precompute_all_channels()
+                self._precompute_all_channels_cached(year=year, month=month)
 
         print(f"[TIMING-Dataset] precompute_channels: {time.time()-_init_t:.2f}s")
         
@@ -259,6 +319,185 @@ class ARDatasetImproved(Dataset):
         npy_path  = os.path.join(self.TENSOR_CACHE_DIR, f"tensors_{date_str}.npy")
         meta_path = os.path.join(self.TENSOR_CACHE_DIR, f"tensors_{date_str}.meta.npy")
         return npy_path, meta_path
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Phase 1 — split contract: predictors (physics) vs labels (heuristic masks)
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _get_split_cache_path(self, year, month):
+        """Return (npy_path, meta_path) for the split-contract cache."""
+        date_str  = f"{year:04d}{month:02d}"
+        npy_path  = os.path.join(self.SPLIT_CACHE_DIR, f"split_{date_str}.npy")
+        meta_path = os.path.join(self.SPLIT_CACHE_DIR, f"split_{date_str}.meta.npy")
+        return npy_path, meta_path
+
+    def _resize_stack(self, data: np.ndarray) -> np.ndarray:
+        """Bilinear-resize a (C, H, W) stack to self.target_size (no-op if equal).
+
+        Mirrors the resize at the end of _compute_single_sample so predictors and
+        labels land on exactly the same grid as the legacy tensors.
+        """
+        if data.shape[1:] == (self.target_size[0], self.target_size[1]):
+            return np.ascontiguousarray(data, dtype=np.float32)
+        data = np.ascontiguousarray(data, dtype=np.float32)
+        try:
+            tensor = torch.from_numpy(data).unsqueeze(0)
+        except (TypeError, RuntimeError):
+            # Fallback for numpy/torch build mismatch (e.g. ROCm on Frontier)
+            tensor = torch.tensor(data, dtype=torch.float32).unsqueeze(0)
+        tensor = F.interpolate(
+            tensor, size=self.target_size, mode='bilinear', align_corners=False
+        ).squeeze(0)
+        return tensor.numpy()
+
+    def _build_predictor_stack(self, idx: int) -> np.ndarray:
+        """Stack the 6 RAW physical predictor fields for one timestep.
+
+        Values are left in physical units on purpose — the split cache stores raw
+        data so the normalisation can be changed later without a rebuild.
+        Standardisation happens in __getitem__ via self.predictor_stats.
+        """
+        fields = []
+        for name, attr in self.PREDICTOR_SPECS:
+            arr = getattr(self, attr, None)
+            if arr is None:
+                if attr == "ivt_raw":
+                    raise ValueError(
+                        "predictor 'IVT' requires self.ivt_raw, which is absent. "
+                        "Do NOT fall back to self.ivt: the preprocessed cache "
+                        "zeroed it below 400 kg/m/s, so it is effectively the AR "
+                        "label (IoU 0.917) and would re-create the Phase 0 copy "
+                        "shortcut. Supply 'ivt_raw' = sqrt(Qu^2 + Qv^2) from the "
+                        "source ERA5 file (precompute_tensors.py does this in "
+                        "--split mode)."
+                    )
+                raise ValueError(f"predictor '{name}' (self.{attr}) is missing")
+            fields.append(np.asarray(arr[idx], dtype=np.float32))
+
+        target_shape = fields[0].shape
+        cleaned = []
+        for f in fields:
+            if f.shape != target_shape:
+                f = np.broadcast_to(f, target_shape)
+            cleaned.append(np.ascontiguousarray(f, dtype=np.float32))
+        return np.stack(cleaned, axis=0)   # (6, H, W) raw
+
+    def _compute_split_sample(self, idx: int) -> np.ndarray:
+        """Build one (10, H, W) split sample: 6 raw predictors + 4 float labels.
+
+        Labels are sliced out of the legacy 14-channel computation so the science
+        criteria are bit-identical to what the model was previously trained on —
+        Phase 1 changes only WHAT THE MODEL CAN SEE, not how the masks are made.
+        They are kept as floats (not binarised) so the loss and metrics stay free
+        to choose their own threshold; ETC in particular carries a graded
+        intensity that post_processing reads at >= 0.90.
+        """
+        legacy = self._compute_single_sample(idx)          # (14, H, W), resized
+        labels = legacy[self.LEGACY_LABEL_CHANNELS]        # (4, H, W)
+        preds = self._resize_stack(self._build_predictor_stack(idx))  # (6, H, W)
+        return np.concatenate([preds, labels], axis=0)     # (10, H, W)
+
+    def _precompute_split_cached(self, year=None, month=None):
+        """Build (or load) the whole month of split samples.
+
+        Fast path   : split_{YYYYMM}.npy exists -> np.load
+        Medium path : legacy v2 tensors exist -> reuse their mask channels and
+                      only build the cheap raw-predictor stack (~seconds)
+        Slow path   : neither -> run the full ~23 min scipy mask precompute
+        """
+        t0 = _time.time()
+        expected_shape = (self.total_samples,
+                          self.N_PREDICTORS + self.N_LABELS,
+                          self.target_size[0], self.target_size[1])
+
+        # ── Fast path ────────────────────────────────────────────────────────
+        if year is not None and month is not None:
+            npy_path, _ = self._get_split_cache_path(year, month)
+            if os.path.exists(npy_path):
+                try:
+                    loaded = np.load(npy_path, mmap_mode='r')
+                    if loaded.shape == expected_shape:
+                        self.precomputed_data = np.array(loaded, dtype=np.float32)
+                        print(f"  ✅ [SPLIT CACHE HIT] {npy_path} "
+                              f"in {_time.time()-t0:.1f}s "
+                              f"({self.precomputed_data.nbytes/1024**2:.0f} MB)")
+                        return
+                    print(f"  ⚠️  Split cache shape mismatch: expected "
+                          f"{expected_shape}, got {loaded.shape}. Recomputing...")
+                except Exception as e:
+                    print(f"  ⚠️  Split cache load failed ({e}). Recomputing...")
+
+        # ── Medium path: reuse the legacy v2 tensors for the mask channels ───
+        legacy_data = None
+        if year is not None and month is not None:
+            legacy_npy, _ = self._get_tensor_cache_path(year, month)
+            if os.path.exists(legacy_npy):
+                try:
+                    cand = np.load(legacy_npy, mmap_mode='r')
+                    if cand.shape == (self.total_samples, 14,
+                                      self.target_size[0], self.target_size[1]):
+                        legacy_data = cand
+                        print(f"  ♻️  [SPLIT] reusing legacy masks from {legacy_npy} "
+                              f"— skipping the scipy precompute")
+                    else:
+                        print(f"  ⚠️  Legacy cache shape {cand.shape} unusable; "
+                              f"will recompute masks")
+                except Exception as e:
+                    print(f"  ⚠️  Legacy cache unreadable ({e}); will recompute masks")
+
+        if legacy_data is None:
+            print(f"  🔄 [SPLIT CACHE MISS] full precompute for "
+                  f"{year:04d}-{month:02d} (~23 min)...")
+            self._precompute_all_channels()          # fills self.precomputed_data (N,14,H,W)
+            legacy_data = self.precomputed_data
+
+        # ── Assemble the split tensors ───────────────────────────────────────
+        N = self.total_samples
+        out = np.zeros(expected_shape, dtype=np.float32)
+        for i in range(N):
+            preds = self._resize_stack(self._build_predictor_stack(i))
+            out[i, :self.N_PREDICTORS] = preds
+            out[i, self.N_PREDICTORS:] = np.asarray(
+                legacy_data[i][self.LEGACY_LABEL_CHANNELS], dtype=np.float32)
+        self.precomputed_data = out
+
+        print(f"  [SPLIT] built {N} samples in {_time.time()-t0:.1f}s "
+              f"({out.nbytes/1024**2:.0f} MB)")
+
+        # ── Save ─────────────────────────────────────────────────────────────
+        if year is not None and month is not None:
+            try:
+                os.makedirs(self.SPLIT_CACHE_DIR, exist_ok=True)
+                npy_path, meta_path = self._get_split_cache_path(year, month)
+                np.save(npy_path, self.precomputed_data)
+                np.save(meta_path, self.time)
+                print(f"  💾 [SPLIT CACHE SAVED] {npy_path}")
+            except Exception as e:
+                print(f"  ⚠️  Could not save split cache: {e}")
+
+    def _normalise_predictors(self, preds: np.ndarray) -> np.ndarray:
+        """Standardise the raw predictor stack in place-ish, returning a copy.
+
+        Falls back to identity (with a one-time warning) when no stats are given,
+        so a missing stats file is loud rather than silently training on
+        unnormalised MSLP in pascals.
+        """
+        if self.predictor_stats is None:
+            if not getattr(self, "_warned_no_stats", False):
+                print("  ⚠️  No predictor_stats supplied — predictors are RAW. "
+                      "Training on unstandardised fields will not converge; "
+                      "pass predictor_stats (see build_split_cache.py --stats).")
+                self._warned_no_stats = True
+            return preds
+        out = np.empty_like(preds)
+        for c, name in enumerate(self.PREDICTOR_NAMES):
+            st = self.predictor_stats.get(name)
+            if st is None:
+                out[c] = preds[c]
+                continue
+            std = float(st["std"])
+            out[c] = (preds[c] - float(st["mean"])) / (std if std > 0 else 1.0)
+        return out
 
     def _precompute_all_channels_cached(self, year=None, month=None):
         """
@@ -914,6 +1153,8 @@ class ARDatasetImproved(Dataset):
         filter_center_km: float       = 400.0,
         max_wind_threshold: float     = 8.0,       # m/s — CyTRACK Condition iv
         radius_msw_km: float          = 100.0,     # km — CyTRACK radius_for_msw
+        equatorial_vor_scale: float   = 0.5,       # 1.0 = no equatorial relaxation
+        require_both: bool            = False,     # True = iv AND v, not iv OR v
     ) -> np.ndarray:
         """
         CyTRACK-style TC centre detection.
@@ -971,7 +1212,10 @@ class ARDatasetImproved(Dataset):
         vor_thresh = self.vor850_hurricane_threshold if self.vor850_hurricane_threshold is not None \
                     else vorticity_threshold
         equatorial_band = np.abs(lat_2d) < 10.0
-        vor_thresh_2d = np.where(equatorial_band, vor_thresh * 0.5, vor_thresh)
+        # equatorial_vor_scale relaxes the vorticity floor near the equator, where
+        # Coriolis is weak. 1.0 removes the relaxation; it is a screening knob.
+        vor_thresh_2d = np.where(equatorial_band, vor_thresh * equatorial_vor_scale,
+                                 vor_thresh)
         nh_vor = (lat_2d >= 0) & (vor_field >=  vor_thresh_2d)
         sh_vor = (lat_2d <  0) & (vor_field <= -vor_thresh_2d)
         cond_v = nh_vor | sh_vor
@@ -992,7 +1236,11 @@ class ARDatasetImproved(Dataset):
                 continue
             has_wind = local_wind_max[r, c] >= max_wind_threshold   # iv
             has_vor  = cond_v[r, c]                                 # v
-            if not (has_wind or has_vor):                    # need at least one
+            # require_both=True restores the strict CyTRACK reading (iv AND v).
+            # The default OR was relaxed for landfalling storms that lose vorticity
+            # to surface friction while keeping wind, or vice versa.
+            ok = (has_wind and has_vor) if require_both else (has_wind or has_vor)
+            if not ok:
                 continue
             valid[r, c] = 1.0
 
@@ -1082,6 +1330,14 @@ class ARDatasetImproved(Dataset):
                 filter_center_km       = 400.0,
                 max_wind_threshold     = 8.0,        # CyTRACK paper value
                 radius_msw_km          = 150.0,      # wider search for asymmetric landfalling winds
+                # Conditions iv AND v, not iv OR v. The OR was relaxed for
+                # landfalling storms that lose vorticity to surface friction while
+                # keeping wind. Tier B screening (phase4_tc_label_screen.py) over
+                # 2003+2012, 2924 steps, physics only, measured that relaxation at
+                # 105,604 extra false objects for 2 extra storms out of 3,271:
+                # POD 0.888 -> 0.887, FAR 0.986 -> 0.973, CSI 0.014 -> 0.027,
+                # detections 72.2 -> 36.1 per step against ~2.3 real storms.
+                require_both           = True,
             )        
 
         # ── Dilate centres → regional influence mask ──────────────────────────────
@@ -1894,17 +2150,50 @@ class ARDatasetImproved(Dataset):
     def __len__(self) -> int:
         return self.total_samples
     
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
+        data = np.ascontiguousarray(data, dtype=np.float32)
+        try:
+            return torch.from_numpy(data).to(dtype=self.dtype)
+        except (TypeError, RuntimeError):
+            # Fallback for numpy/torch build mismatch (e.g. ROCm on Frontier)
+            return torch.tensor(data, dtype=self.dtype)
+
+    def _getitem_split(self, idx: int):
+        """Split contract: (predictors (6,H,W) standardised, labels (4,H,W)).
+
+        The model never sees the labels. That is the whole point of Phase 1 —
+        the copy shortcut the Phase 0 ablation measured becomes impossible to
+        express, not merely unrewarded.
+        """
+        if hasattr(self, 'precomputed_data') and self.precomputed_data is not None:
+            sample = self.precomputed_data[idx]
+        else:
+            sample = self._compute_split_sample(idx)
+
+        preds = np.asarray(sample[:self.N_PREDICTORS], dtype=np.float32)
+        labels = np.asarray(sample[self.N_PREDICTORS:], dtype=np.float32)
+        return self._to_tensor(self._normalise_predictors(preds)), self._to_tensor(labels)
+
+    def __getitem__(self, idx: int):
         """
         Get a precomputed sample. All expensive scipy/numpy mask computations
         were done once during __init__ by _precompute_all_channels().
-        
+
         Args:
             idx: Sample index
-            
+
         Returns:
-            Tensor with shape (14, height, width)
+            output_mode="legacy" : Tensor (14, height, width)
+            output_mode="split"  : (predictors (6,H,W), labels (4,H,W))
         """
+        if self.output_mode == "split":
+            try:
+                return self._getitem_split(idx)
+            except Exception as e:
+                print(f"Error processing split sample {idx}: {e}")
+                return (torch.zeros(self.N_PREDICTORS, *self.target_size, dtype=self.dtype),
+                        torch.zeros(self.N_LABELS, *self.target_size, dtype=self.dtype))
+
         try:
             # Fast path: return precomputed data (zero CPU overhead)
             if hasattr(self, 'precomputed_data') and self.precomputed_data is not None:
@@ -2265,3 +2554,130 @@ def preprocess_data_improved(ivt: xr.DataArray,
     
     return combined_ds
 
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 2 — direct split-cache dataset
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SplitCacheDataset(Dataset):
+    """Reads tensor_cache_v3_split months directly, with global shuffling.
+
+    The split cache is self-contained — 6 raw predictors + 4 labels, already on
+    the model grid — so training needs no ERA5, IBTrACS, percentile or
+    climatology loading at all. That removes essentially all of the per-month
+    setup cost and, more importantly, lets one Dataset span MANY months.
+
+    Why that matters: the legacy loop trained on one monthly file at a time
+    (main.py -> train_wnet_improved per file), so the model saw January, then
+    February, and so on. Each file is a few hundred steps of a single month's
+    weather, which is textbook catastrophic forgetting — and it makes the loss
+    curve a record of which month is currently loaded rather than of learning.
+    Indexing every (month, timestep) pair up front and letting the sampler
+    shuffle across all of them fixes that without any extra machinery.
+
+    Months are memory-mapped, so the 179 GB cache is never resident; only the
+    touched samples are paged in.
+
+    Args:
+        files            : list of split_YYYYMM.npy paths
+        predictor_stats  : {name: {mean, std}} from compute_predictor_stats.py
+        target_threshold : if not None, labels are binarised at this value
+    """
+
+    def __init__(self, files, predictor_stats=None, target_threshold=None,
+                 dtype=torch.float32, stride=1, crop_rows=None):
+        super().__init__()
+        self.files = list(files)
+        self.dtype = dtype
+        self.target_threshold = target_threshold
+        self.stride = max(1, int(stride))
+        # Keep only the first crop_rows latitude rows. The 0.25 deg cache has 721 rows (90..-90)
+        # and the U-Net needs a multiple of 8, so crop_rows=720 drops the -90 row.
+        self.crop_rows = crop_rows
+        self._maps = {}          # lazily opened per worker process
+
+        n_pred = ARDatasetImproved.N_PREDICTORS
+        names = ARDatasetImproved.PREDICTOR_NAMES
+        if predictor_stats is None:
+            self.centre = np.zeros(n_pred, dtype=np.float32)
+            self.scale = np.ones(n_pred, dtype=np.float32)
+            print("  ⚠️  SplitCacheDataset: no predictor_stats — predictors are RAW. "
+                  "Training will not converge; run compute_predictor_stats.py.")
+        else:
+            self.centre = np.array([predictor_stats[n]["mean"] for n in names],
+                                   dtype=np.float32)
+            self.scale = np.array([predictor_stats[n]["std"] for n in names],
+                                  dtype=np.float32)
+            self.scale[self.scale <= 0] = 1.0
+
+        # (file_idx, timestep) index over every month
+        self.index = []
+        self.months = []
+        for fi, f in enumerate(self.files):
+            a = np.load(f, mmap_mode="r")
+            expect_c = n_pred + ARDatasetImproved.N_LABELS
+            if a.ndim != 4 or a.shape[1] != expect_c:
+                print(f"  ⚠️  skipping {os.path.basename(f)}: shape {a.shape}")
+                continue
+            self.months.append(f)
+            # stride>1 subsamples timesteps. Near-lossless for validation:
+            # consecutive 6-hourly frames are near-duplicates, so every 4th step
+            # covers the same weather at a quarter of the cost. In the first
+            # Phase 2 smoke run validation was 1461 batches against 60 training
+            # batches, i.e. most of the epoch was spent re-scoring near-copies.
+            for t in range(0, a.shape[0], self.stride):
+                self.index.append((fi, t))
+            del a
+        print(f"  SplitCacheDataset: {len(self.months)} months, "
+              f"{len(self.index)} timesteps"
+              + (f" (stride {self.stride})" if self.stride > 1 else ""))
+
+    def _get_map(self, fi):
+        m = self._maps.get(fi)
+        if m is None:
+            m = np.load(self.files[fi], mmap_mode="r")
+            self._maps[fi] = m
+        return m
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, i):
+        fi, t = self.index[i]
+        sample = self._get_map(fi)[t]
+        if self.crop_rows:
+            sample = sample[:, :self.crop_rows]
+        sample = np.asarray(sample, dtype=np.float32)
+        n_pred = ARDatasetImproved.N_PREDICTORS
+
+        x = (sample[:n_pred] - self.centre[:, None, None]) / self.scale[:, None, None]
+        y = sample[n_pred:]
+        if self.target_threshold is not None:
+            y = (y > self.target_threshold).astype(np.float32)
+
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        y = np.ascontiguousarray(y, dtype=np.float32)
+        try:
+            return (torch.from_numpy(x).to(dtype=self.dtype),
+                    torch.from_numpy(y).to(dtype=self.dtype))
+        except (TypeError, RuntimeError):
+            return (torch.tensor(x, dtype=self.dtype),
+                    torch.tensor(y, dtype=self.dtype))
+
+
+def split_cache_files(cache_dir=None, years=None):
+    """List split_YYYYMM.npy paths, optionally restricted to `years`."""
+    import glob as _glob
+    cache_dir = cache_dir or ARDatasetImproved.SPLIT_CACHE_DIR
+    out = []
+    for f in sorted(_glob.glob(os.path.join(cache_dir, "split_*.npy"))):
+        if f.endswith(".meta.npy"):
+            continue
+        stem = os.path.basename(f).replace("split_", "").replace(".npy", "")
+        if len(stem) != 6 or not stem.isdigit():
+            continue
+        if years is not None and int(stem[:4]) not in set(years):
+            continue
+        out.append(f)
+    return out

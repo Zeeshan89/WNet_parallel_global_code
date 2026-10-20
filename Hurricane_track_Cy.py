@@ -139,7 +139,8 @@ class HurricaneTracker:
         """
         Check if movement is meteorologically realistic (matching comparison code)
         """
-        distance = self.haversine_distance(lon1, lat1, lon2, lat2)
+        # BUG FIX (2026-09-23): arguments were (lon1, lat1, lon2, lat2); see Hurricane_track.py.
+        distance = self.haversine_distance(lat1, lon1, lat2, lon2)
         
         if time_diff_hours <= 0:
             return False

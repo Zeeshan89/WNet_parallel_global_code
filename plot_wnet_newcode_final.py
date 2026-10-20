@@ -30,6 +30,27 @@ import matplotlib.pyplot as plt
 from scipy.interpolate import RegularGridInterpolator
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap, BoundaryNorm
+
+# White->blue->green->yellow->red sequential colormap: 0 is WHITE so empty/low
+# background stays clean (unlike turbo/viridis, whose low end is dark).
+WBGYR = LinearSegmentedColormap.from_list("wbgyr", [
+    (0.00, "#ffffff"), (0.08, "#d8ecf9"), (0.18, "#a6d5ee"), (0.30, "#5fb0db"),
+    (0.38, "#3f93c6"), (0.46, "#2fa08c"), (0.56, "#5cbf5a"), (0.64, "#a5d63f"),
+    (0.72, "#f2e534"), (0.82, "#f6a623"), (0.91, "#e8551f"), (1.00, "#b00000"),
+], N=256)
+OVER_COLOR = "#ff00d4"   # magenta "over" arrow (values above the top level)
+
+
+def _disc(levels, base=WBGYR):
+    """Discrete banded (cmap, norm) from `levels`: white below levels[0], magenta
+    above levels[-1] — the NCL-style stepped colorbar (use extend='both', uniform
+    spacing, ticks=levels on the colorbar)."""
+    cols = base(np.linspace(0.06, 1.0, len(levels) - 1))
+    cmap = ListedColormap(cols)
+    cmap.set_under("white")
+    cmap.set_over(OVER_COLOR)
+    return cmap, BoundaryNorm(levels, cmap.N)
 
 # ------------------------------------------
 # Helpers
@@ -52,17 +73,24 @@ def regrid_mask_to_target_grid(fmask_dataset, var_name, target_lat2d, target_lon
     points = np.stack([target_lat2d.ravel(), target_lon2d.ravel()], axis=-1)
     return interp(points).reshape(target_lat2d.shape)
 
-def plot_spatial_map(data, lat2d, lon2d, title, vmin, vmax, cmap, label, mask=None, save_path=None):
+def plot_spatial_map(data, lat2d, lon2d, title, vmin, vmax, cmap, label, mask=None,
+                     save_path=None, levels=None):
     fig = plt.figure(figsize=(12, 6))
     ax = plt.axes(projection=ccrs.PlateCarree())
 
     if mask is not None:
         data = np.ma.masked_where(np.isnan(mask), data)
 
-    im = ax.pcolormesh(
-        lon2d, lat2d, data, shading='auto', cmap=cmap,
-        transform=ccrs.PlateCarree(), vmin=vmin, vmax=vmax
-    )
+    cbar_kw = dict(orientation='vertical', pad=0.02, extend='neither')
+    if levels is not None:
+        # discrete banded fill + NCL-style stepped colorbar (white under, magenta over)
+        dcmap, norm = _disc(levels)
+        im = ax.pcolormesh(lon2d, lat2d, data, shading='auto', cmap=dcmap,
+                           norm=norm, transform=ccrs.PlateCarree())
+        cbar_kw.update(extend='both', ticks=levels, spacing='uniform')
+    else:
+        im = ax.pcolormesh(lon2d, lat2d, data, shading='auto', cmap=cmap,
+                           transform=ccrs.PlateCarree(), vmin=vmin, vmax=vmax)
 
     ax.coastlines(resolution='50m')
     ax.add_feature(cfeature.BORDERS)
@@ -70,7 +98,7 @@ def plot_spatial_map(data, lat2d, lon2d, title, vmin, vmax, cmap, label, mask=No
     ax.set_extent([np.nanmin(lon2d), np.nanmax(lon2d), np.nanmin(lat2d), np.nanmax(lat2d)])
 
     ax.set_title(title)
-    cbar = plt.colorbar(im, ax=ax, orientation='vertical', pad=0.02)
+    cbar = plt.colorbar(im, ax=ax, **cbar_kw)
     cbar.set_label(label)
     plt.tight_layout()
 
@@ -318,9 +346,10 @@ def load_outputs_and_plot(
         title="Mean Annual MCS Days (gated)",
         vmin=0,
         vmax=np.nanpercentile(mean_days.values, 99),
-        cmap="YlOrRd",
+        cmap=WBGYR,
         label="Days/year",
         mask=msk,
+        levels=[2, 5, 10, 15, 20, 30, 40, 50, 70, 100],
         save_path=os.path.join(out_plot_dir, "mean_annual_mcs_days.png")
     )
 
@@ -329,9 +358,10 @@ def load_outputs_and_plot(
         title="Mean Annual MCS Hours (gated)",
         vmin=0,
         vmax=np.nanpercentile(mean_hours.values, 99),
-        cmap="YlOrRd",
+        cmap=WBGYR,
         label="Hours/year",
         mask=msk,
+        levels=[50, 100, 200, 300, 500, 700, 1000, 1500, 2000, 3000],
         save_path=os.path.join(out_plot_dir, "mean_annual_mcs_hours.png")
     )
 
@@ -340,9 +370,10 @@ def load_outputs_and_plot(
         title="Mean Hours per Active MCS Day (hours/day) (gated)",
         vmin=0,
         vmax=np.nanpercentile(mean_hpad.values, 99),
-        cmap="viridis",
+        cmap=WBGYR,
         label="Hours per MCS day",
         mask=msk,
+        levels=[6, 7, 8, 9, 10, 12, 14, 16, 20],
         save_path=os.path.join(out_plot_dir, "mean_hours_per_active_day.png")
     )
 
@@ -351,9 +382,10 @@ def load_outputs_and_plot(
         title="Mean Precipitation During MCS (gated)",
         vmin=0,
         vmax=np.nanpercentile(mean_avg_precip.values, 99),
-        cmap="Blues",
+        cmap=WBGYR,
         label="(native precip units per step/rate)",
         mask=msk,
+        levels=[0.1, 0.2, 0.5, 1, 2, 3, 5, 8, 12],
         save_path=os.path.join(out_plot_dir, "mean_mcs_precip.png")
     )
 
@@ -362,9 +394,10 @@ def load_outputs_and_plot(
         title="% of Precipitation from MCS (gated)",
         vmin=0,
         vmax=50,
-        cmap="YlGnBu",
+        cmap=WBGYR,
         label="%",
         mask=msk,
+        levels=[1, 2, 5, 10, 15, 20, 25, 30, 40],
         save_path=os.path.join(out_plot_dir, "percent_precip_from_mcs.png")
     )
     plot_spatial_map(
@@ -374,9 +407,10 @@ def load_outputs_and_plot(
     title="Mean Annual MCS Days (from Hours / 24)",
     vmin=0,
     vmax=50,
-    cmap="YlGnBu",
+    cmap=WBGYR,
     label="Equivalent days/year",
     mask=msk,
+    levels=[2, 5, 10, 15, 20, 25, 30, 40, 50],
     save_path=os.path.join(out_plot_dir, "mean_annual_mcs_days_from_hours.png")
 )
 
@@ -521,10 +555,10 @@ def load_outputs_and_plot(
 # ------------------------------------------
 if __name__ == "__main__":
     # directory containing per-year subfolders created by the analysis
-    base_output_dir = "outputs_wnet_standard_IWV_60k"  # change per dataset
+    base_output_dir = "outputs_wnet_hourly_IWV"  # change per dataset
     load_outputs_and_plot(
         base_output_dir,
         dataset_name="TE",
-        out_plot_dir="summary_plots_mcs_wnet_IWV_60k"
+        out_plot_dir="summary_plots_hourly_IWV"
     )
 

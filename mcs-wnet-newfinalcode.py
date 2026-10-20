@@ -46,12 +46,14 @@ from scipy.ndimage import center_of_mass
 # -----------------------
 # USER SETTINGS
 # -----------------------
-START_YEAR = 2004
-END_YEAR   = 2014
+START_YEAR = int(os.environ.get("MCS_START_YEAR", "2004"))
+END_YEAR   = int(os.environ.get("MCS_END_YEAR", "2014"))
 
-MCS_DIR    = "/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/WNet_parallel_global_code/ARs_Hurricanes_ETCs_MCS/Output_new_IWV_60k/"
-PRECIP_DIR = "/lustre/orion/proj-shared/cli138/dr6/eventtype//Data/ERA5/input"  # expects ERA5_tp_input_{year}_6hourly_conus.nc
-OUTPUT_DIR = "outputs_wnet_standard_IWV_60k"
+MCS_DIR    = os.environ.get("MCS_DIR", "/lustre/orion/proj-shared/cli138/z7a/Storms_data/Storms_precipitation_notebooks/WNet_parallel_global_code/ARs_Hurricanes_ETCs_MCS/Output_new_IWV_60k/")
+PRECIP_DIR = os.environ.get("PRECIP_DIR", "/lustre/orion/proj-shared/cli138/dr6/eventtype//Data/ERA5/input")  # expects ERA5_tp_input_{year}_6hourly_conus.nc
+OUTPUT_DIR = os.environ.get("MCS_OUTPUT_DIR", "outputs_wnet_standard_IWV_60k")
+# glob pattern for monthly detection files; hourly outputs need the 'hourly_' infix variant
+MCS_PATTERN = os.environ.get("MCS_PATTERN", "era5dara_{year}{month:02d}_MCS_detection*.nc")
 
 LAT_BOUNDS = (25.0, 50.99454)
 LON_BOUNDS = (-109.9899, -70.0101)
@@ -114,7 +116,7 @@ def safe_scalar(x):
 # Open WNet monthly -> yearly
 # -----------------------
 def open_wnet_year(mcs_dir: str, year: int,
-                   pattern: str = "era5dara_{year}{month:02d}_MCS_detection*.nc") -> xr.Dataset:
+                   pattern: str = MCS_PATTERN) -> xr.Dataset:
     """Assemble a year from monthly WNet MCS files, carrying the tracked MCS_id.
 
     MCS_id restarts at 1 in each monthly file, so we offset each month's nonzero
@@ -201,10 +203,12 @@ def monthly_storm_hours_by_id(mcs_ids: xr.DataArray, keep: xr.DataArray) -> pd.S
     dt_h = int(round(compute_dt_hours(mcs_ids.time.values)))
     T = mcs_ids.sizes["time"]
 
+    data_all = np.asarray(mcs_ids.values)   # load once (avoid T dask computes per timestep)
+    keep_all = np.asarray(keep.values)
     ids_per_time = []
     for i in range(T):
-        arr = mcs_ids.isel(time=i).values
-        km = keep.isel(time=i).values
+        arr = data_all[i]
+        km = keep_all[i]
         if np.ma.isMaskedArray(arr):
             arr = arr.filled(np.nan)
         arr = np.where(km, arr, np.nan)
@@ -304,8 +308,9 @@ def load_align_wnet_and_precip(year: int):
     tp_mm.attrs["units"] = "mm"
     tp_mm.attrs["long_name"] = "Total precipitation per step (mm)"
 
-    # nearest within half-step tolerance
-    tol = np.timedelta64(int(round(dt_hours / 2)), "h")
+    # nearest within half of the PRECIP step (precip is 6-hourly), so hourly MCS steps
+    # each map to the nearest 6-hourly precip (round(dt/2)=0 for hourly would give all-NaN).
+    tol = np.timedelta64(3, "h")
     tp_mm = tp_mm.reindex(time=mcs.time, method="nearest", tolerance=tol)
 
     mcs, mcs_ids, tp_mm = xr.align(mcs, mcs_ids, tp_mm, join="inner")
@@ -314,6 +319,36 @@ def load_align_wnet_and_precip(year: int):
 # -----------------------
 # Per-year processing
 # -----------------------
+_CONUS_MASK_CACHE = {}
+def conus_mask_for(lat_da, lon_da):
+    """Boolean DataArray (latitude,longitude): True only inside the CONUS landmask.
+    Built from Natural Earth admin-1 US states (excl. Alaska/Hawaii) via cartopy.
+    Cached per grid (Natural Earth data is cached under $HOME, so compute nodes reuse it)."""
+    lat1d = np.asarray(lat_da.values); lon1d = np.asarray(lon_da.values)
+    key = (float(lat1d[0]), float(lat1d[-1]), lat1d.size, float(lon1d[0]), float(lon1d[-1]), lon1d.size)
+    if key in _CONUS_MASK_CACHE:
+        return _CONUS_MASK_CACHE[key]
+    import cartopy.io.shapereader as shpreader
+    from shapely.geometry import Point
+    from shapely.ops import unary_union
+    from shapely.prepared import prep
+    shp = shpreader.natural_earth(resolution="50m", category="cultural",
+                                  name="admin_1_states_provinces_lakes")
+    geoms = [r.geometry for r in shpreader.Reader(shp).records()
+             if r.attributes.get("admin") == "United States of America"
+             and r.attributes.get("name") not in ("Alaska", "Hawaii")]
+    pc = prep(unary_union(geoms))
+    m = np.zeros((lat1d.size, lon1d.size), dtype=bool)
+    for i, la in enumerate(lat1d):
+        for j, lo in enumerate(lon1d):
+            m[i, j] = pc.contains(Point(float(lo), float(la)))
+    da = xr.DataArray(m, dims=("latitude", "longitude"),
+                      coords={"latitude": lat_da.values, "longitude": lon_da.values})
+    print(f"  [CONUS mask] {int(m.sum())}/{m.size} cells inside CONUS", flush=True)
+    _CONUS_MASK_CACHE[key] = da
+    return da
+
+
 def process_year(year: int):
     print(f"\n--- WNet year {year} --- {datetime.utcnow().isoformat()}")
 
@@ -331,7 +366,10 @@ def process_year(year: int):
 
     # keep = (MCS_id > 0). ID-based storm-hours count CONCURRENT tracks (no longer a surrogate);
     # metric definitions are identical to the Feng benchmark above.
-    keep = mcs_ids > 0
+    # CONUS-only: drop all MCS presence outside the CONUS landmask, so every downstream
+    # metric (maps + domain/monthly sums) is restricted to CONUS.
+    conus = conus_mask_for(mcs_ids["latitude"], mcs_ids["longitude"])
+    keep = (mcs_ids > 0) & conus
 
     # Annual maps
     keep_daily = keep.resample(time="1D").max().astype("int8")
@@ -358,13 +396,28 @@ def process_year(year: int):
     mon_mean     = monthly_mean_cell_hours(keep, dt_hours)
     mon_idhours  = monthly_storm_hours_by_id(mcs_ids, keep)
 
-    # Summary (per ID, gated)
-    mcs_ids_gated = mcs_ids.where(keep, other=0)
-    summary_df = extract_properties_per_id(mcs_ids_gated, lat1d, lon1d)
+    # Summary (per ID). This per-ID extraction is O(n_ids x T x cells) and becomes the
+    # dominant cost at hourly cadence (8760 steps x thousands of IDs -> hours). Its output
+    # (summary.csv) is NOT consumed by plot_wnet_newcode_final.py, so it is skippable:
+    # set MCS_SKIP_SUMMARY=1 to bypass it (default keeps the original 6-hourly behavior).
+    if os.environ.get("MCS_SKIP_SUMMARY", "0") == "1":
+        summary_df = pd.DataFrame()
+    else:
+        mcs_ids_gated = mcs_ids.where(keep, other=0)
+        summary_df = extract_properties_per_id(mcs_ids_gated, lat1d, lon1d)
 
     # Domain-wide days/year
     daily_any = keep_daily.max(dim=keep_daily.dims[1:])
     domain_days = int(safe_scalar(daily_any.sum()))
+
+    # CONUS-only: blank (NaN) everything outside the CONUS landmask in the saved maps
+    # (keep is already CONUS-gated for the sums; this makes the map cells outside CONUS
+    # empty rather than zero, matching the benchmark look).
+    yearly_days          = yearly_days.where(conus)
+    freq_hours           = freq_hours.where(conus)
+    hours_per_active_day = hours_per_active_day.where(conus)
+    avg_precip           = avg_precip.where(conus)
+    percent_precip       = percent_precip.where(conus)
 
     # Save
     ydir = os.path.join(OUTPUT_DIR, str(year))

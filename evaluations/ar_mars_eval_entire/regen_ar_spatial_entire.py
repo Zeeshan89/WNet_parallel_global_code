@@ -15,12 +15,31 @@ Outputs (this folder): ar_spatial_entire.{png,pdf}, summary_ar_entire_1980_2024.
 import os, numpy as np
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap, BoundaryNorm
 import cartopy.crs as ccrs, cartopy.feature as cfeature
 import xarray as xr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EVAL = os.path.join(HERE, "..", "ar_mars_eval")
 EPS = 1e-12
+
+# ---- discrete white->blue->green->yellow->red (WBGYR) colorbar (0 -> white,
+#      above top level -> magenta, triangle over/under arrows) ----
+WBGYR = LinearSegmentedColormap.from_list("wbgyr", [
+    (0.00, "#ffffff"), (0.08, "#d8ecf9"), (0.18, "#a6d5ee"), (0.30, "#5fb0db"),
+    (0.38, "#3f93c6"), (0.46, "#2fa08c"), (0.56, "#5cbf5a"), (0.64, "#a5d63f"),
+    (0.72, "#f2e534"), (0.82, "#f6a623"), (0.91, "#e8551f"), (1.00, "#b00000"),
+], N=256)
+OVER_COLOR = "#ff00d4"
+LV_FREQ = [0.01, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12]      # AR frequency
+LV_DAYS = [5, 20, 40, 60, 80, 100, 120]                  # mean AR days/yr
+LV_F1   = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]  # per-pixel F1
+
+
+def disc(levels):
+    cols = WBGYR(np.linspace(0.06, 1.0, len(levels) - 1))
+    cmap = ListedColormap(cols); cmap.set_under("white"); cmap.set_over(OVER_COLOR)
+    return cmap, BoundaryNorm(levels, cmap.N)
 
 # ---- combine primary + OOP pixel counts -> entire period (1980-2024) ----
 z = np.load(os.path.join(EVAL, "ar_eval_cache.npz"), allow_pickle=True)
@@ -69,12 +88,11 @@ def plot():
     prd_freq = (pix["tp"] + pix["fp"]) / n_t
     f1_pix = 2*pix["tp"] / (2*pix["tp"] + pix["fp"] + pix["fn"] + EPS)
     f1_pix = np.where((pix["tp"] + pix["fn"]) > 0, f1_pix, -1.0)
-    fv = np.nanpercentile(tgt_freq, 99.5)
-    panel = {0: (tgt_freq, lon, "MARS AR frequency", "Blues", (0, fv)),
-             1: (mars_days, mars_lon, "MARS mean AR days/yr", "YlGnBu", (0, DAYS_VMAX)),
-             3: (prd_freq, lon, "WNet AR frequency", "Blues", (0, fv)),
-             4: (wnet_days, wnet_lon, "WNet mean AR days/yr", "YlGnBu", (0, DAYS_VMAX)),
-             5: (f1_pix, lon, "per-pixel F1", "viridis", (0, 1))}
+    panel = {0: (tgt_freq, lon, "MARS AR frequency", LV_FREQ),
+             1: (mars_days, mars_lon, "MARS mean AR days/yr", LV_DAYS),
+             3: (prd_freq, lon, "WNet AR frequency", LV_FREQ),
+             4: (wnet_days, wnet_lon, "WNet mean AR days/yr", LV_DAYS),
+             5: (f1_pix, lon, "per-pixel F1", LV_F1)}
     fig, axes = plt.subplots(2, 3, figsize=(21, 8),
                              subplot_kw=dict(projection=ccrs.PlateCarree(central_longitude=0)))
     for idx, ax in enumerate(axes.ravel()):
@@ -91,13 +109,11 @@ def plot():
             axd.tick_params(labelsize=11); axd.grid(alpha=0.3)
             axd.legend(fontsize=11, loc="upper right")
             continue
-        field, src_lon, title, cmap, (vmin, vmax) = panel[idx]
+        field, src_lon, title, levels = panel[idx]
         lon_p, field_p = to_pm180(field, src_lon)
-        cmap_obj = plt.get_cmap(cmap).copy()
-        if title == "per-pixel F1":
-            cmap_obj.set_under(cmap_obj(0.0))
+        cmap_obj, norm = disc(levels)
         m = ax.pcolormesh(lon_p, lat, field_p, transform=ccrs.PlateCarree(),
-                          cmap=cmap_obj, vmin=vmin, vmax=vmax, shading="auto", rasterized=True)
+                          cmap=cmap_obj, norm=norm, shading="auto", rasterized=True)
         ax.coastlines(lw=0.4, color="0.25")
         ax.add_feature(cfeature.BORDERS, linewidth=0.25, edgecolor="0.45")
         ax.set_extent([-180, 180, -90, 90], crs=ccrs.PlateCarree())
@@ -105,11 +121,12 @@ def plot():
         gl.top_labels = False; gl.right_labels = False
         gl.xlabel_style = {"size": 12}; gl.ylabel_style = {"size": 12}
         ax.set_title(title, fontsize=12)
-        cb = fig.colorbar(m, ax=ax, orientation="vertical", shrink=0.7, pad=0.02)
+        cb = fig.colorbar(m, ax=ax, orientation="vertical", shrink=0.7, pad=0.02,
+                          extend="both", spacing="uniform", ticks=levels)
         cb.ax.tick_params(labelsize=12)
     fig.tight_layout()
     for ext in ("png", "pdf"):
-        out = os.path.join(HERE, f"ar_spatial_entire.{ext}")
+        out = os.path.join(HERE, f"ar_spatial_entire_discrete.{ext}")
         fig.savefig(out, dpi=300, bbox_inches="tight"); print("wrote", out)
     plt.close(fig)
 

@@ -309,7 +309,11 @@ def load_hurricane_tracks_from_dir(hurr_dir, start_year, end_year):
     return out
 
 
-def load_etc_tracks_from_txt(etc_dir, start_year, end_year):
+ETC_TXT_PATTERN = "ETC_tracks_{year:04d}_meteorological.txt"
+ETC_TXT_PATTERN_V2 = "ETC_tracks_{year:04d}_meteorological_v2.txt"
+
+
+def load_etc_tracks_from_txt(etc_dir, start_year, end_year, pattern=ETC_TXT_PATTERN):
     """
     Parse per-year ETC_tracks_YYYY_meteorological.txt files.
 
@@ -318,11 +322,16 @@ def load_etc_tracks_from_txt(etc_dir, start_year, end_year):
 
     Note: this format puts LON before LAT (opposite of the hurricane format).
 
+    `pattern` selects the filename convention: the v2 production run names its
+    files ETC_tracks_YYYY_meteorological_v2.txt, so pass ETC_TXT_PATTERN_V2 for
+    Global_ARs_Hurr_ETCs_MCS_finalized_v2. The default keeps every existing
+    caller reading the v1 files unchanged.
+
     Returns: list of dicts with the same shape used by match_tracks().
     """
     out = []
     for year in range(start_year, end_year + 1):
-        path = os.path.join(etc_dir, f"ETC_tracks_{year:04d}_meteorological.txt")
+        path = os.path.join(etc_dir, pattern.format(year=year))
         if not os.path.exists(path):
             print(f"  WARN: no ETC track file for {year}: {path}")
             continue
