@@ -27,8 +27,7 @@ Objects that fail are thresholded again inside their own footprint at the 87.5th
 92.5th and 95th percentiles. This follows the Guan and Waliser design and fixes the
 earlier behaviour where an AR vanished at the coastline.
 
-**Tropical cyclones** are discs placed on the observed IBTrACS positions over the full
-storm lifecycle, rather than a heuristic detector run on the reanalysis.
+**Tropical cyclones** using different reanalysis variables, like MSLP, vorticity, and windspeed. Validated against IBTrACS.
 
 **Extratropical cyclones** require a closed pressure contour around the surface low, the
 TempestExtremes criterion, instead of a local minimum inside a box.
@@ -59,15 +58,15 @@ Steps run in order; each writes what the next one reads.
 | 1 | `precompute_tensors.py --split` | Builds the monthly cache from the raw NetCDF inputs. |
 | 2 | `phase4_ivt_percentiles.py` | Per cell, per season IVT percentiles, the intensity term of the AR target. |
 | 3 | `phase4_build_ar_label.py` | Builds the atmospheric river target from those percentiles plus the geometry and transport tests. |
-| 4 | `phase4_build_ibtracs_label.py` | Builds the observed tropical cyclone target from IBTrACS. |
-| 5 | `phase4_build_etc_label.py` | Builds the closed contour extratropical cyclone target. |
-| 6 | `build_fullres_cache.py` | Assembles the 0.25 degree cache: six predictors and the four targets, one file per month, checked against the earlier cache. |
-| 7 | `compute_predictor_stats.py` | Derives the mean and standard deviation used to scale each predictor field. |
-| 8 | `main_phase2.py` | Trains the network. |
-| 9 | `phase4_export_detections.py` | Runs the trained model over the record and writes monthly detection files, one per storm type. |
-| 10 | `export_hourly_fullres.py` | Hourly MCS detections, predictors assembled on the fly. |
-| 11 | `phase4_run_trackers.py` | Runs the trackers on those files to produce storm tracks. |
-| 12 | `phase4_add_mcs_ids.py` | Adds tracked MCS identifiers to the MCS detection files. |
+
+| 4 | `phase4_build_etc_label.py` | Builds the closed contour extratropical cyclone target. |
+| 5 | `build_fullres_cache.py` | Assembles the 0.25 degree cache: six predictors and the four targets, one file per month, checked against the earlier cache. |
+| 6 | `compute_predictor_stats.py` | Derives the mean and standard deviation used to scale each predictor field. |
+| 7 | `main_phase2.py` | Trains the network. |
+| 8 | `phase4_export_detections.py` | Runs the trained model over the record and writes monthly detection files, one per storm type. |
+| 9 | `export_hourly_fullres.py` | Hourly MCS detections, predictors assembled on the fly. |
+| 10 | `phase4_run_trackers.py` | Runs the trackers on those files to produce storm tracks. |
+| 11 | `phase4_add_mcs_ids.py` | Adds tracked MCS identifiers to the MCS detection files. |
 
 `scripts/` holds one SLURM launcher per step as a worked example. They are written for
 OLCF Frontier and carry site specific paths, module loads and account names, so treat
@@ -102,7 +101,7 @@ system.
 | `phase4_build_ar_label.py` | Applies the definition and writes the target, native or into a cache. |
 | `etc_closed_contour.py` | Cyclone centres as closed pressure lows, shared by the target and the tracker. |
 | `phase4_build_etc_label.py` | Builds the extratropical cyclone target. |
-| `phase4_build_ibtracs_label.py` | Builds the IBTrACS tropical cyclone target. |
+
 | `phase4_tc_label_screen.py` | Screening rules used when building that target. |
 
 **Model and training**
