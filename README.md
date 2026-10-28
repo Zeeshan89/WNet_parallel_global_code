@@ -7,18 +7,14 @@ mesoscale convective systems.
 
 `METHODOLOGY.md` describes the method. This file describes the code.
 
-Source files only. No data, model weights, results or figures are included.
 
 ## What changed in this revision
 
-The ERA5 configuration now runs at the **native 0.25 degree grid, 721 x 1440**, instead
-of the earlier 192 x 384. The network pools three times, so training drops the row at
--90 to give 720 x 1440 (`main_phase2.py --crop-rows 720`); inference instead reflect
-pads 721 rows to 728 and crops back, so the exported files keep the full grid.
+The ERA5 configuration runs at the **native 0.25 degree grid, 721 x 1440**. 
 
 Three of the four training targets were rebuilt:
 
-**Atmospheric rivers** are no longer a single global threshold on IVT. A cell qualifies
+**Atmospheric rivers** A cell qualifies
 where IVT exceeds the 85th percentile *for that cell and that five month season*, with
 an absolute floor of 175 kg m-1 s-1 tapering to 100 toward the poles, and the connected
 object must then be at least 2000 km long, at least twice as long as it is wide, carry
@@ -32,11 +28,11 @@ earlier behaviour where an AR vanished at the coastline.
 **Extratropical cyclones** require a closed pressure contour around the surface low, the
 TempestExtremes criterion, instead of a local minimum inside a box.
 
-**Mesoscale convective systems** are unchanged.
+**Mesoscale convective systems** MCS are detected using BT calculated from OLR. The detection uses criteria of outer and inner core with 241 and 225, respectively. Afterwards, moisture anomaly is used to capture more robust MCSs. 
 
 ## How it works, end to end
 
-The model reads six physical fields for each six hourly timestep: integrated vapour
+The model reads six physical fields for each six hourly timestep at native 0.25degree: integrated vapour
 transport, sea level pressure, relative vorticity at 850 hPa, wind speed at 850 hPa,
 cloud top temperature and total column water vapour. It returns four probability maps,
 one per storm type. A cell becomes a detection when its probability exceeds one half.
@@ -55,7 +51,7 @@ Steps run in order; each writes what the next one reads.
 
 | Step | Script | What it does |
 |---|---|---|
-| 1 | `precompute_tensors.py --split` | Builds the monthly cache from the raw NetCDF inputs. |
+| 1 | `precompute_tensors.py --split` | Builds the monthly cache from the raw NetCDF inputs, to avoid preprocessing again and again at every single run. |
 | 2 | `phase4_ivt_percentiles.py` | Per cell, per season IVT percentiles, the intensity term of the AR target. |
 | 3 | `phase4_build_ar_label.py` | Builds the atmospheric river target from those percentiles plus the geometry and transport tests. |
 
@@ -159,4 +155,4 @@ runs one pass per class.
 
 Python 3, with numpy, xarray, netCDF4, scipy, scikit image, matplotlib, cartopy and
 PyTorch. Training and inference expect GPUs and use PyTorch distributed data parallel.
-The trackers run on CPU.
+
