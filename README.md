@@ -8,7 +8,7 @@ mesoscale convective systems.
 `METHODOLOGY.md` describes the method. This file describes the code.
 
 
-## What changed in this revision
+## What is in this revision
 
 The ERA5 configuration runs at the **native 0.25 degree grid, 721 x 1440**. 
 
