@@ -1,0 +1,34 @@
+{
+  "upload_type": "software",
+  "title": "Knowledge-Guided WNet: code for detecting four storm types in ERA5 and attributing global precipitation",
+  "version": "1.0-era5",
+  "language": "eng",
+  "license": "mit",
+  "description": "Training, inference, and evaluation code for the knowledge-guided WNet framework that detects tropical cyclones, extratropical cyclones, atmospheric rivers, and mesoscale convective systems from six ERA5 fields at 0.25 degree and six-hourly resolution over 1980 to 2024, and attributes precipitation to storm type. This release accompanies the manuscript 'Knowledge-Guided WNet: Detecting Four Storm Types and Attributing Global Precipitation' submitted to Geoscientific Model Development. The detections produced with this code are archived at https://doi.org/10.5281/zenodo.24112115.",
+  "creators": [
+    {"name": "Aslam, Zeeshan", "affiliation": "Bredesen Center, The University of Tennessee, Knoxville, TN, USA"},
+    {"name": "Rastogi, Deeksha", "affiliation": "Computational Sciences and Engineering Division, Oak Ridge National Laboratory, Oak Ridge, TN, USA"},
+    {"name": "Kao, Shih-Chieh", "affiliation": "Computational Sciences and Engineering Division, Oak Ridge National Laboratory, Oak Ridge, TN, USA"},
+    {"name": "Hoffman, Forrest M.", "affiliation": "Computational Sciences and Engineering Division, Oak Ridge National Laboratory, Oak Ridge, TN, USA"},
+    {"name": "Molina, Maria J.", "affiliation": "Department of Atmospheric and Oceanic Science, University of Maryland, College Park, MD, USA"},
+    {"name": "Ganguly, Auroop R.", "affiliation": "Institute for Experiential Artificial Intelligence and Sustainability and Data Sciences Lab, Northeastern University, Boston, MA, USA"},
+    {"name": "Khattak, Asad J.", "affiliation": "Department of Civil and Environmental Engineering, The University of Tennessee, Knoxville, TN, USA"},
+    {"name": "Fu, Joshua S.", "affiliation": "Department of Civil and Environmental Engineering, The University of Tennessee, Knoxville, TN, USA"},
+    {"name": "Ashfaq, Moetasim", "affiliation": "Computational Sciences and Engineering Division, Oak Ridge National Laboratory, Oak Ridge, TN, USA"}
+  ],
+  "keywords": [
+    "ERA5",
+    "storm detection",
+    "tropical cyclones",
+    "extratropical cyclones",
+    "atmospheric rivers",
+    "mesoscale convective systems",
+    "precipitation attribution",
+    "deep learning",
+    "WNet",
+    "PyTorch"
+  ],
+  "related_identifiers": [
+    {"identifier": "10.5281/zenodo.24112115", "relation": "isSourceOf", "resource_type": "dataset"}
+  ]
+}
